@@ -1,0 +1,393 @@
+// MoneyForesight v2 — переработанная и исправленная версия (июль 2026)
+//
+// Происхождение модулей (важно для атрибуции по MPL 2.0 при публикации на TradingView):
+//   1. Chandelier Stop — концепция Chuck LeBeau, реализация в духе everget
+//   2. Веер EMA (3/5/9)
+//   3. Rainbow MA — взвешенная MA на бета-распределении, в духе скриптов alexgrover
+//   4. Сигналы ADX(DMI) + MACD — распространённая публичная связка
+//   5. Support/Resistance Channels — на основе скрипта LonesomeTheBlue
+//
+// Изменения v2 относительно оригинала:
+//   • свечи красятся по состоянию сигнала (trade), а не по мгновенному условию;
+//     barcolor вместо plotcandle — свечи графика больше не дублируются, белых свечей нет
+//   • параметры Chandelier Stop вынесены в настройки (были зашиты в код)
+//   • trade и направление Chandelier переведены на var — устойчивое состояние вместо
+//     хрупкого паттерна «переменная без var + чтение самой себя через [1]»
+//   • палитра из 200 захардкоженных цветов заменена на color.from_gradient —
+//     нет риска выхода индекса за границы массива
+//   • RSI радужной линии обёрнут в nz() — нет na-цвета в период прогрева
+//   • деление при расчёте весов приведено к float (защита от целочисленного деления)
+//   • массив times ограничен 10000 элементами — больше не растёт бесконечно
+//   • устранено затенение переменных (src и др.), убран дублирующийся //@version=5
+//   • S/R: если выбранный старший ТФ младше ТФ графика — используется ТФ графика
+//   • сигналы и алерты по умолчанию подтверждаются закрытием бара (без мигания внутри бара)
+//   • НОВОЕ — блок Confluence: BUY/SELL дополнительно фильтруются направлением
+//     Chandelier Stop, «теплом» Rainbow MA и (опционально, только на живом крае
+//     графика) близостью к зонам поддержки/сопротивления
+//   • НОВОЕ — подтверждение сигналов объёмом: разворот состояния засчитывается только
+//     на баре, где объём выше SMA(объёма) × множитель; на инструментах без данных
+//     объёма фильтр автоматически пропускает все бары
+//
+// Осознанно оставлено как в оригинале:
+//   • зоны S/R считаются только на последнем баре — исторических зон нет,
+//     бэктест по ним невозможен (архитектура исходного скрипта)
+//   • сила зоны = 20 очков за пивот + 1 очко за касание OHLC (авторская калибровка)
+//   • цикл силы зон смотрит фиксированные 500 баров: на короткой истории
+//     na-бары безвредно игнорируются
+//@version=5
+indicator('MoneyForesight v2', overlay = true)
+
+// ═════════════════════════ 1 · CHANDELIER STOP ═════════════════════════
+g1 = '1 · Chandelier Stop'
+showcs      = input.bool(true, 'Show Chandelier Stop', group = g1)
+csLength    = input.int(22, 'Look Back Period', minval = 1, group = g1)
+csATRPeriod = input.int(22, 'ATR Period', minval = 1, group = g1)
+csMult      = input.float(3.0, 'ATR Multiplier', minval = 0.1, step = 0.1, group = g1)
+
+csATR      = ta.atr(csATRPeriod)
+short_stop = ta.lowest(csLength) + csMult * csATR
+long_stop  = ta.highest(csLength) - csMult * csATR
+
+var float shortvs = na
+var float longvs  = na
+shortvs := na(shortvs) ? short_stop : close > shortvs ? short_stop : math.min(short_stop, shortvs)
+longvs  := na(longvs) ? long_stop : close < longvs ? long_stop : math.max(long_stop, longvs)
+
+longswitch  = close >= shortvs[1] and close[1] < shortvs[1]
+shortswitch = close <= longvs[1] and close[1] > longvs[1]
+
+var int csDir = 0
+csDir := csDir >= 0 and shortswitch ? -1 : csDir <= 0 and longswitch ? 1 : csDir
+
+pc      = csDir > 0 ? longvs : shortvs
+csColor = csDir > 0 ? color.aqua : color.fuchsia
+
+plot(showcs ? pc : na, title = 'CS Circles', color = csColor, style = plot.style_circles, linewidth = 2)
+plot(showcs ? pc : na, title = 'CS Line', color = csColor, style = plot.style_line, linewidth = 2)
+
+// ═════════════════════════ 2 · ВЕЕР EMA ═════════════════════════
+g2 = '2 · EMA Fan'
+ema1Len = input.int(3, 'EMA 1 Length', minval = 1, group = g2)
+ema1Src = input.source(close, 'EMA 1 Source', group = g2)
+ema1Off = input.int(0, 'EMA 1 Offset', minval = -500, maxval = 500, group = g2)
+ema2Len = input.int(5, 'EMA 2 Length', minval = 1, group = g2)
+ema2Src = input.source(close, 'EMA 2 Source', group = g2)
+ema2Off = input.int(0, 'EMA 2 Offset', minval = -500, maxval = 500, group = g2)
+ema3Len = input.int(9, 'EMA 3 Length', minval = 1, group = g2)
+ema3Src = input.source(close, 'EMA 3 Source', group = g2)
+ema3Off = input.int(0, 'EMA 3 Offset', minval = -500, maxval = 500, group = g2)
+
+plot(ta.ema(ema1Src, ema1Len), title = 'EMA 3', color = color.blue, offset = ema1Off)
+plot(ta.ema(ema2Src, ema2Len), title = 'EMA 5', color = color.orange, offset = ema2Off)
+plot(ta.ema(ema3Src, ema3Len), title = 'EMA 9', color = color.purple, offset = ema3Off)
+
+// ═════════════════════════ 3 · RAINBOW MA ═════════════════════════
+g3 = '3 · Rainbow MA'
+rbLength = input.int(50, 'Length', minval = 2, group = g3)
+rbAlpha  = input.float(3.0, '+Lag (alpha)', minval = 1, maxval = 10, group = g3)
+rbBeta   = input.float(3.0, '-Lag (beta)', minval = 1, maxval = 10, group = g3)
+rbSrc    = input.source(close, 'Source', group = g3)
+
+var rbWeights = array.new_float(0)
+if barstate.isfirst
+    for i = 0 to rbLength - 1
+        x = i / (rbLength - 1.0)
+        array.push(rbWeights, math.pow(x, rbAlpha - 1) * math.pow(1 - x, rbBeta - 1))
+rbDen = array.sum(rbWeights)
+
+float rbSum = 0.0
+for i = 0 to rbLength - 1
+    rbSum += rbSrc[i] * array.get(rbWeights, i)
+filt = rbSum / rbDen
+
+// тепло тренда: 0 = перепроданность (красный), 1 = сила (зелёный); до прогрева RSI — нейтральные 0.5
+rbHeat  = nz(ta.rsi(filt, rbLength), 50) / 100
+rbColor = rbHeat <= 0.5 ? color.from_gradient(rbHeat, 0.0, 0.5, #FF1100, #FFAB00) : color.from_gradient(rbHeat, 0.5, 1.0, #FFAB00, #30FF85)
+plot(filt, title = 'Rainbow MA', color = rbColor, linewidth = 2)
+
+// ═════════════════════════ 4 · СИГНАЛЫ: ADX + MACD ═════════════════════════
+g4 = '4 · Signals: ADX + MACD'
+showsignals      = input.bool(true, 'Show BUY/SELL Signals', group = g4)
+showcandlecolors = input.bool(true, 'Color Candles by Signal State', group = g4)
+waitForClose     = input.bool(true, 'Signals on Bar Close Only', tooltip = 'Сигнал и алерт появляются только после закрытия бара — без мигания внутри бара', group = g4)
+adxLength    = input.int(14, 'ADX Length', minval = 1, group = g4)
+adxSmoothing = input.int(10, 'ADX Smoothing', minval = 1, group = g4)
+macdSource   = input.source(close, 'MACD Source', group = g4)
+macdFast     = input.int(12, 'MACD Fast Length', minval = 1, group = g4)
+macdSlow     = input.int(26, 'MACD Slow Length', minval = 1, group = g4)
+macdSig      = input.int(9, 'MACD Signal Length', minval = 1, group = g4)
+colorup      = input.color(color.green, 'Up Candle Color', group = g4)
+colordown    = input.color(color.red, 'Down Candle Color', group = g4)
+
+g6 = '6 · Confluence Filters'
+useCsFilter = input.bool(true, 'Filter by Chandelier Direction', tooltip = 'BUY только при бычьем Chandelier Stop, SELL — при медвежьем. Выключите оба фильтра, чтобы получить поведение v1.', group = g6)
+useRbFilter = input.bool(true, 'Filter by Rainbow Heat', tooltip = 'BUY только когда Rainbow MA в зелёной половине палитры (heat > 0.5), SELL — в красной', group = g6)
+useSrFilter = input.bool(false, 'Block Signals Near S/R (live only)', tooltip = 'Гасит BUY под сопротивлением и SELL над поддержкой. Работает ТОЛЬКО на живом крае графика (зоны считаются на последнем баре): исторические сигналы не фильтруются, при перезагрузке графика погашенные сигналы могут появиться в истории.', group = g6)
+srBuffer    = input.float(0.5, 'S/R Buffer (× ATR 14)', minval = 0.0, step = 0.1, tooltip = 'Насколько близко к зоне (в ATR за 14 баров) сигнал считается «упирающимся» в неё', group = g6)
+useVolFilter = input.bool(true, 'Confirm Signals by Volume', tooltip = 'Смена состояния (и сигнал) засчитывается только на баре, где объём выше своей средней × порог. Слабые развороты без объёма игнорируются. На инструментах без данных объёма фильтр пропускает все бары.', group = g6)
+volLen       = input.int(20, 'Volume SMA Length', minval = 1, group = g6)
+volMult      = input.float(1.2, 'Volume Threshold (× SMA)', minval = 0.1, step = 0.1, tooltip = '1.0 = объём просто выше среднего; 1.2 = минимум на 20% выше среднего; 1.5–2.0 = только явные всплески', group = g6)
+
+[diplus, diminus, adxValue] = ta.dmi(adxLength, adxSmoothing)
+[macdLine, signalLine, histLine] = ta.macd(macdSource, macdFast, macdSlow, macdSig)
+
+// подтверждение объёмом: na-объём (инструменты без данных) и период прогрева SMA пропускаются
+volSMA = ta.sma(volume, volLen)
+volOK  = na(volume) or na(volSMA) or volume > volSMA * volMult
+
+longcheck  = diplus > diminus and macdLine > signalLine and (not useCsFilter or csDir > 0) and (not useRbFilter or rbHeat > 0.5) and (not useVolFilter or volOK)
+shortcheck = diminus > diplus and signalLine > macdLine and (not useCsFilter or csDir < 0) and (not useRbFilter or rbHeat < 0.5) and (not useVolFilter or volOK)
+
+var int trade = 0
+trade := longcheck ? 1 : shortcheck ? -1 : trade
+
+// окраска по СОСТОЯНИЮ trade (не по мгновенному условию); в нейтрале — родной цвет свечи
+barcolor(showcandlecolors ? (trade == 1 ? colorup : trade == -1 ? colordown : color(na)) : color(na), title = 'Signal State Candles')
+
+// ═════════════════════════ 5 · ПОДДЕРЖКА / СОПРОТИВЛЕНИЕ ═════════════════════════
+g5 = '5 · Support / Resistance'
+TF          = input.timeframe('D', 'Higher Time Frame', group = g5)
+prd         = input.int(5, 'Pivot Period', minval = 1, maxval = 30, tooltip = 'Used while calculating Pivot Points, checks left&right bars', group = g5)
+loopback    = input.int(250, 'Loopback Period', minval = 50, maxval = 400, tooltip = 'While calculating S/R levels it checks Pivots in Loopback Period', group = g5)
+ChannelW    = input.float(6, 'Maximum Channel Width %', minval = 1, maxval = 15, group = g5)
+minstrength = input.int(2, 'Minimum Strength', minval = 1, tooltip = 'Channel must contain at least X Pivot Points', group = g5)
+maxnumsr    = input.int(6, 'Maximum Number of S/R', minval = 1, maxval = 10, group = g5) - 1
+showsrfit   = input.bool(true, 'Show S/Rs that Fit the Chart', group = g5)
+showtable   = input.bool(true, 'Show S/R Channels in a Table', group = g5)
+tableposy   = input.string('bottom', 'Table Location', options = ['bottom', 'middle', 'top'], inline = 'chartpos', group = g5)
+tableposx   = input.string('left', '', options = ['left', 'center', 'right'], inline = 'chartpos', group = g5)
+res_col     = input.color(color.new(color.red, 75), 'Resistance Color', group = g5)
+sup_col     = input.color(color.new(color.lime, 75), 'Support Color', group = g5)
+inch_col    = input.color(color.new(color.gray, 75), 'Color When Price in Channel', group = g5)
+
+// если выбранный ТФ младше ТФ графика — request.security вернёт мусор; берём ТФ графика
+srTF = timeframe.in_seconds(TF) < timeframe.in_seconds(timeframe.period) ? timeframe.period : TF
+
+atr14 = ta.atr(14)
+
+get_highlow() =>
+    var hlm = matrix.new<float>(loopback, 2, 0.)
+    if barstate.islast // use less memory
+        for x = 0 to loopback - 1
+            matrix.set(hlm, x, 0, high[x])
+            matrix.set(hlm, x, 1, low[x])
+    hlm
+hlmatrix = request.security(syminfo.tickerid, srTF, get_highlow(), lookahead = barmerge.lookahead_on)
+
+if na(hlmatrix)
+    runtime.error('You should choose Time Frame wisely')
+if matrix.rows(hlmatrix) < prd * 10
+    runtime.error('There is not enough candles on Time Frame you choose. You better choose Time Frame wisely')
+
+get_pivotvals(hlm) =>
+    highs = matrix.col(hlm, 0)
+    lows  = matrix.col(hlm, 1)
+    pivotvals = array.new_float(0)
+    for x = prd to array.size(highs) - prd - 1
+        if array.get(highs, x) >= array.max(array.slice(highs, x - prd, x + prd + 1))
+            array.push(pivotvals, array.get(highs, x))
+        if array.get(lows, x) <= array.min(array.slice(lows, x - prd, x + prd + 1))
+            array.push(pivotvals, array.get(lows, x))
+    pivotvals
+
+// find/calculate SR channel/strength by using pivot points
+get_sr_vals(pivotvals, cwidth, ind) =>
+    float lo = array.get(pivotvals, ind)
+    float hi = lo
+    int numpp = 0
+    for y = 0 to array.size(pivotvals) - 1
+        float cpp = array.get(pivotvals, y)
+        float wdth = cpp <= hi ? hi - cpp : cpp - lo
+        if wdth <= cwidth // fits the max channel width?
+            if cpp <= hi
+                lo := math.min(lo, cpp)
+            else
+                hi := math.max(hi, cpp)
+            numpp := numpp + 20 // each pivot point added as 20
+    [hi, lo, numpp]
+
+var srLevels = array.new_float(20, 0) // min & max levels * 10
+
+// swap two channels inside the levels array
+swapLevels(levels, x, y) =>
+    tmp = array.get(levels, y * 2)
+    array.set(levels, y * 2, array.get(levels, x * 2))
+    array.set(levels, x * 2, tmp)
+    tmp := array.get(levels, y * 2 + 1)
+    array.set(levels, y * 2 + 1, array.get(levels, x * 2 + 1))
+    array.set(levels, x * 2 + 1, tmp)
+
+// get related S/R level
+get_level(levels, ind) =>
+    float ret = na
+    if ind < array.size(levels)
+        if array.get(levels, ind) != 0
+            ret := array.get(levels, ind)
+    ret
+
+// get the color of related S/R level
+get_color(levels, ind) =>
+    color ret = na
+    if ind < array.size(levels)
+        if array.get(levels, ind) != 0
+            ret := array.get(levels, ind) > close and array.get(levels, ind + 1) > close ? res_col : array.get(levels, ind) < close and array.get(levels, ind + 1) < close ? sup_col : inch_col
+    ret
+
+// find and use highest/lowest on current chart if "Show S/Rs that fit the Chart" enabled
+var times = array.new_int(0)
+array.unshift(times, time)
+if array.size(times) > 10000 // не растим массив бесконечно
+    array.pop(times)
+visibleBars = 1
+if time == chart.right_visible_bar_time
+    idx = array.indexof(times, chart.left_visible_bar_time)
+    visibleBars := idx >= 0 ? idx + 1 : math.min(bar_index + 1, 10000)
+chart_highest = ta.highest(visibleBars)
+chart_lowest  = ta.lowest(visibleBars)
+// use 5% more (симметрично, от исходного диапазона)
+chartRange = chart_highest - chart_lowest
+chart_highest += chartRange * 0.05
+chart_lowest  -= chartRange * 0.05
+
+// alerts
+resistancebroken = false
+supportbroken = false
+
+// флаги «цена упирается в зону» для Confluence-фильтра (только живой край)
+var bool srNearRes = false
+var bool srNearSup = false
+
+// calculate S/R on last bar
+if barstate.islast
+    pivotvals = get_pivotvals(hlmatrix)
+
+    // calculate maximum S/R channel width
+    prdhighest = array.max(pivotvals)
+    prdlowest  = array.min(pivotvals)
+    cwidth = (prdhighest - prdlowest) * ChannelW / 100
+
+    supres = array.new_float(0) // strength, hi, lo per pivot
+    srStren = array.new_float(10, 0)
+    // get levels and strengths
+    for x = 0 to array.size(pivotvals) - 1
+        [hi, lo, strength] = get_sr_vals(pivotvals, cwidth, x)
+        array.push(supres, strength)
+        array.push(supres, hi)
+        array.push(supres, lo)
+
+    // check last 500 bars on current time frame and add each OHLC touch to strength
+    for x = 0 to array.size(pivotvals) - 1
+        h = array.get(supres, x * 3 + 1)
+        l = array.get(supres, x * 3 + 2)
+        s = 0
+        for y = 0 to 499
+            if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l) or (open[y] <= h and open[y] >= l) or (close[y] <= h and close[y] >= l)
+                s := s + 1
+        array.set(supres, x * 3, array.get(supres, x * 3) + s)
+
+    // reset SR levels
+    array.fill(srLevels, 0)
+    // get strongest SRs
+    srCount = 0
+    for x = 0 to array.size(pivotvals) - 1
+        stv = -1. // value
+        stl = -1  // location
+        for y = 0 to array.size(pivotvals) - 1
+            if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minstrength * 20
+                stv := array.get(supres, y * 3)
+                stl := y
+        if stl >= 0
+            // get sr level
+            hh = array.get(supres, stl * 3 + 1)
+            ll = array.get(supres, stl * 3 + 2)
+            array.set(srLevels, srCount * 2, hh)
+            array.set(srLevels, srCount * 2 + 1, ll)
+            array.set(srStren, srCount, array.get(supres, stl * 3))
+
+            // make included pivot points' strength zero
+            for y = 0 to array.size(pivotvals) - 1
+                if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
+                    array.set(supres, y * 3, -1)
+
+            srCount += 1
+            if srCount >= 10
+                break
+
+    // sort S/R according to their strengths
+    for x = 0 to 8
+        for y = x + 1 to 9
+            if array.get(srStren, y) > array.get(srStren, x)
+                tmp = array.get(srStren, y)
+                array.set(srStren, y, array.get(srStren, x))
+                array.set(srStren, x, tmp)
+                swapLevels(srLevels, x, y)
+
+    var srtable = table.new(position = tableposy + '_' + tableposx, columns = 5, rows = 11, frame_width = 1, frame_color = color.gray, border_width = 1, border_color = color.gray)
+    if showtable
+        table.cell(srtable, 0, 0, text = 'TF:' + srTF + ' Sorted by the Strength MoneyForesight ', text_color = color.rgb(230, 20, 100), bgcolor = color.yellow)
+        table.merge_cells(srtable, 0, 0, 3, 0)
+
+    // show S/R channels and table rows if enabled
+    var srchannels = array.new_box(10)
+    rowindex = 1
+    for x = 0 to math.min(9, maxnumsr)
+        box.delete(array.get(srchannels, x))
+        srcol = get_color(srLevels, x * 2)
+        if not na(srcol)
+            if not showsrfit or (get_level(srLevels, x * 2 + 1) <= chart_highest and get_level(srLevels, x * 2) >= chart_lowest)
+                array.set(srchannels, x, box.new(left = math.max(bar_index - 300, 0), top = get_level(srLevels, x * 2), right = bar_index + 1, bottom = get_level(srLevels, x * 2 + 1), border_color = srcol, border_width = 1, extend = extend.both, bgcolor = srcol))
+            if showtable
+                srtext = srcol == res_col ? 'Resistance' : 'Support'
+                bgcol  = srcol == res_col ? color.rgb(200, 0, 0) : color.rgb(0, 200, 0)
+                txtcol = srcol == res_col ? color.white : color.black
+                table.cell(table_id = srtable, column = 0, row = rowindex, text = str.tostring(rowindex), text_color = txtcol, bgcolor = bgcol)
+                table.cell(table_id = srtable, column = 1, row = rowindex, text = srtext, text_color = txtcol, bgcolor = bgcol)
+                table.cell(table_id = srtable, column = 2, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2 + 1))), text_color = txtcol, bgcolor = bgcol)
+                table.cell(table_id = srtable, column = 3, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2))), text_color = txtcol, bgcolor = bgcol)
+                rowindex += 1
+
+    // alerts: check if the price is not in a channel
+    not_in_a_channel = true
+    for x = 0 to math.min(9, maxnumsr)
+        if close <= array.get(srLevels, x * 2) and close >= array.get(srLevels, x * 2 + 1)
+            not_in_a_channel := false
+
+    // if price is not in a channel then check if S/R was broken
+    if not_in_a_channel
+        for x = 0 to math.min(9, maxnumsr)
+            if close[1] <= array.get(srLevels, x * 2) and close > array.get(srLevels, x * 2)
+                resistancebroken := true
+            if close[1] >= array.get(srLevels, x * 2 + 1) and close < array.get(srLevels, x * 2 + 1)
+                supportbroken := true
+
+    // Confluence: цена внутри зоны или в пределах буфера от неё
+    srNearRes := false
+    srNearSup := false
+    if useSrFilter
+        for x = 0 to math.min(9, maxnumsr)
+            zTop = array.get(srLevels, x * 2)
+            zBot = array.get(srLevels, x * 2 + 1)
+            if zTop != 0
+                if close <= zTop and close >= zBot // внутри зоны — блокируем оба направления
+                    srNearRes := true
+                    srNearSup := true
+                if zBot > close and zBot - close <= atr14 * srBuffer // сопротивление прямо над ценой
+                    srNearRes := true
+                if zTop < close and close - zTop <= atr14 * srBuffer // поддержка прямо под ценой
+                    srNearSup := true
+
+// ═════════════════════════ СИГНАЛЫ И АЛЕРТЫ ═════════════════════════
+confirmOK = not waitForClose or barstate.isconfirmed
+longFlip  = trade == 1 and trade[1] != 1
+shortFlip = trade == -1 and trade[1] != -1
+
+longSignal  = longFlip and confirmOK and (not useSrFilter or not srNearRes)
+shortSignal = shortFlip and confirmOK and (not useSrFilter or not srNearSup)
+
+plotshape(showsignals and longSignal, title = 'BUY', style = shape.labelup, text = 'BUY', textcolor = color.white, color = color.green, size = size.small, location = location.belowbar)
+plotshape(showsignals and shortSignal, title = 'SELL', style = shape.labeldown, text = 'SELL', textcolor = color.white, color = color.red, size = size.small, location = location.abovebar)
+
+alertcondition(longSignal, title = 'LONG', message = 'MoneyForesight LONG')
+alertcondition(shortSignal, title = 'SHORT', message = 'MoneyForesight SHORT')
+alertcondition(resistancebroken, title = 'Resistance Broken', message = 'MoneyForesight: Resistance Broken')
+alertcondition(supportbroken, title = 'Support Broken', message = 'MoneyForesight: Support Broken')

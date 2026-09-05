@@ -1,0 +1,227 @@
+// MoneyForesight Strategy — бэктест-версия индикатора MoneyForesight v3 (июль 2026)
+//
+// Та же логика входов и выходов, что в индикаторе, но через движок стратегий TradingView:
+// вкладка «Тестер стратегий» внизу покажет кривую капитала, чистую прибыль, максимальную
+// просадку, профит-фактор и полный список сделок — С УЧЁТОМ КОМИССИИ.
+//
+// Комиссия задаётся ниже в строке strategy(): commission_value = 0.05 — это % за КАЖДОЕ
+// исполнение (вход и выход отдельно, ~0.1% за круг). Поменяйте под свою биржу:
+// MEXC perpetual futures — taker ~0.02, maker 0. Также задан slippage = 1 тик.
+//
+// Что НЕ вошло относительно индикатора: S/R-фильтр (работает только на живом крае,
+// бэктест по нему невозможен), таблицы и вся декоративная графика.
+// Размер позиции: риск на сделку в % от капитала (Risk per Trade) — позиция подбирается
+// так, чтобы срабатывание стопа стоило ровно этот процент.
+//@version=5
+strategy('MoneyForesight Strategy', overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, max_boxes_count = 100, max_labels_count = 500)
+
+// ═════════════════════════ НАСТРОЙКИ ═════════════════════════
+// Порядок групп = порядок важности. Ищем стратегию ТОЛЬКО ручками из группы «ГЛАВНОЕ»,
+// по одной за прогон. Подсказка у каждого поля — под значком (i).
+gKey = '★ ГЛАВНОЕ: эти 5 ручек ищут стратегию'
+adxThreshold = input.float(18, '1) ADX Threshold — порог тренда', minval = 5, maxval = 50, step = 1, tooltip = 'Отсекает боковик: сделки только когда ADX выше порога. Выше порог — меньше сделок, но чище тренды. Пробовать: 18 / 23 / 28. НЕ ставьте ниже 15 — фильтр фактически выключается и стратегия берёт всю пилу (с ADX=5 у вас и вышло 32% прибыльных). НЕ ставьте выше 35 — входы будут на излёте тренда.', group = gKey)
+rrMult       = input.float(3.0, '2) Take Profit (R) — во сколько раз тейк дальше стопа', minval = 0.5, step = 0.5, tooltip = 'Безубыточный процент прибыльных сделок: 1R→50%, 1.5R→40%, 2R→33%, 3R→25%. Пробовать: 1.5 / 2 / 3. Сравнивайте по чистой прибыли и профит-фактору, а не по winrate.', group = gKey)
+slMode       = input.string('Zone edge', '3) Stop Loss At — где стоит стоп', options = ['Zone edge', 'Chandelier line'], tooltip = 'Zone edge — стоп за внешним краем зоны-магнита: шире, реже выбивает случайным фитилём. Chandelier line — стоп прямо на линии: риск короче, но выбивает чаще.', group = gKey)
+zoneMult     = input.float(0.25, '3a) Zone Width (× ATR) — ширина зоны и запас стопа', minval = 0.05, step = 0.05, tooltip = 'При стопе Zone edge это и есть запас стопа за линией. 0.25 — узко; 0.4 — шире: меньше ложных выбиваний, но больше риск в пунктах на сделку. Тестировать в паре с ручкой 3.', group = gKey)
+flipExit     = input.bool(false, '4) Exit on Chandelier Flip — досрочный выход', tooltip = 'Закрывать сделку при перевороте Chandelier, не дожидаясь тейка или стопа. Включено — раньше режет и убытки, и прибыль. Сравните вкл/выкл: на вашей истории выключение уже улучшало результат.', group = gKey)
+allowLong    = input.bool(true, '5) Longs', inline = 'dir', group = gKey)
+allowShort   = input.bool(true, 'Shorts', inline = 'dir', tooltip = 'Проверьте стороны по отдельности: только лонги, только шорты, обе. На крипте стороны часто несимметричны — одна может кормить, другая сливать.', group = gKey)
+
+gRisk = '2 · Риск и входы (менять в самом конце)'
+riskPct      = input.float(1.0, 'Risk per Trade (% of Equity)', minval = 0.1, maxval = 10, step = 0.1, tooltip = 'Сколько процентов капитала стоит один сработавший стоп. НЕ влияет на знак результата — только на масштаб прибыли и просадки. Поднимать в последнюю очередь, когда стратегия уже в плюсе.', group = gRisk)
+trackRetests = input.bool(true, 'Enter on Retests', tooltip = 'Входить и по ретестам зоны-магнита (откат в зону и возврат за неё) — больше сделок в тренде, стоп короткий.', group = gRisk)
+useReentry   = input.bool(true, 'Re-Enter After Stop-Out', tooltip = 'Повторный вход после выбитого стопа: условия направления держатся + пробой экстремума N баров. Лечит «выбило стоп — тренд ушёл без нас».', group = gRisk)
+reentryLkb   = input.int(5, 'Re-Entry Breakout Bars', minval = 2, maxval = 20, tooltip = 'Сколько баров смотрит пробой при ре-входе. 5 — рабочее значение, без причины не трогать.', group = gRisk)
+retestCooldown = input.int(5, 'Retest Cooldown (bars)', minval = 0, tooltip = 'Минимум баров между ретест-входами — защита от серии входов вдоль зоны. 5 — рабочее значение.', group = gRisk)
+
+gFilt = '3 · Фильтры (обычно не трогать)'
+useAdxFilter = input.bool(true, 'Filter by ADX', tooltip = 'Главный фильтр боковика — держите включённым. Сам порог настраивается в группе ГЛАВНОЕ.', group = gFilt)
+useAdxRising = input.bool(true, 'ADX Rising Counts as Trend', tooltip = 'ADX выше половины порога и растущий 3 бара подряд тоже считается трендом — ловит молодой тренд (сам ADX запаздывает).', group = gFilt)
+useVolFilter = input.bool(true, 'Confirm Signals by Volume', tooltip = 'Вход только на баре с объёмом выше средней × порог — отсекает развороты «без денег».', group = gFilt)
+volLen       = input.int(20, 'Volume SMA Length', minval = 1, group = gFilt)
+volMult      = input.float(1.2, 'Volume Threshold (× SMA)', minval = 0.1, step = 0.1, tooltip = '1.2 = объём минимум на 20% выше среднего. На младших ТФ можно попробовать 1.5.', group = gFilt)
+useCsFilter  = input.bool(true, 'Filter by Chandelier Direction', tooltip = 'Сделки только по направлению Chandelier — держите включённым, это основа системы.', group = gFilt)
+useRbFilter  = input.bool(true, 'Filter by Rainbow Heat', tooltip = 'Лонги только в зелёной половине Rainbow, шорты — в красной.', group = gFilt)
+
+gCore = '4 · Ядро индикатора — НЕ ТРОГАТЬ (риск подгонки под историю)'
+csLength     = input.int(22, 'Chandelier Look Back', minval = 1, group = gCore)
+csATRPeriod  = input.int(22, 'Chandelier ATR Period', minval = 1, group = gCore)
+csMult       = input.float(3.0, 'Chandelier ATR Multiplier', minval = 0.1, step = 0.1, group = gCore)
+adxLength    = input.int(14, 'ADX Length', minval = 1, group = gCore)
+adxSmoothing = input.int(10, 'ADX Smoothing', minval = 1, group = gCore)
+macdSource   = input.source(close, 'MACD Source', group = gCore)
+macdFast     = input.int(12, 'MACD Fast Length', minval = 1, group = gCore)
+macdSlow     = input.int(26, 'MACD Slow Length', minval = 1, group = gCore)
+macdSig      = input.int(9, 'MACD Signal Length', minval = 1, group = gCore)
+rbLength     = input.int(50, 'Rainbow Length', minval = 2, group = gCore)
+rbAlpha      = input.float(3.0, 'Rainbow +Lag (alpha)', minval = 1, maxval = 10, group = gCore)
+rbBeta       = input.float(3.0, 'Rainbow -Lag (beta)', minval = 1, maxval = 10, group = gCore)
+rbSrc        = input.source(close, 'Rainbow Source', group = gCore)
+
+gView = '5 · Отображение'
+showTpsl   = input.bool(true, 'Show TP/SL Boxes', tooltip = 'Боксы активной сделки: красный — риск (вход→стоп), зелёный — прибыль (вход→тейк), ценники TP/SL у правого края. Закрытые сделки остаются бледными боксами.', group = gView)
+keepTrades = input.int(4, 'Keep Last N Closed Trades', minval = 0, maxval = 20, tooltip = 'Сколько закрытых сделок оставлять на графике бледными боксами.', group = gView)
+
+// ═════════════════════════ CHANDELIER + ЗОНА ═════════════════════════
+csATR      = ta.atr(csATRPeriod)
+short_stop = ta.lowest(csLength) + csMult * csATR
+long_stop  = ta.highest(csLength) - csMult * csATR
+
+var float shortvs = na
+var float longvs  = na
+shortvs := na(shortvs) ? short_stop : close > shortvs ? short_stop : math.min(short_stop, shortvs)
+longvs  := na(longvs) ? long_stop : close < longvs ? long_stop : math.max(long_stop, longvs)
+
+longswitch  = close >= shortvs[1] and close[1] < shortvs[1]
+shortswitch = close <= longvs[1] and close[1] > longvs[1]
+
+var int csDir = 0
+csDir := csDir >= 0 and shortswitch ? -1 : csDir <= 0 and longswitch ? 1 : csDir
+
+pc      = csDir > 0 ? longvs : shortvs
+zoneTop = pc + zoneMult * csATR
+zoneBot = pc - zoneMult * csATR
+
+// ═════════════════════════ RAINBOW HEAT ═════════════════════════
+var rbWeights = array.new_float(0)
+if barstate.isfirst
+    for i = 0 to rbLength - 1
+        x = i / (rbLength - 1.0)
+        array.push(rbWeights, math.pow(x, rbAlpha - 1) * math.pow(1 - x, rbBeta - 1))
+rbDen = array.sum(rbWeights)
+
+float rbSum = 0.0
+for i = 0 to rbLength - 1
+    rbSum += rbSrc[i] * array.get(rbWeights, i)
+filt = rbSum / rbDen
+rbHeat = nz(ta.rsi(filt, rbLength), 50) / 100
+
+// ═════════════════════════ ФИЛЬТРЫ И СИГНАЛЫ ═════════════════════════
+[diplus, diminus, adxValue] = ta.dmi(adxLength, adxSmoothing)
+[macdLine, signalLine, histLine] = ta.macd(macdSource, macdFast, macdSlow, macdSig)
+
+volSMA = ta.sma(volume, volLen)
+volOK  = na(volume) or na(volSMA) or volume > volSMA * volMult
+adxOK  = adxValue >= adxThreshold or (useAdxRising and adxValue >= adxThreshold * 0.5 and ta.rising(adxValue, 3))
+
+longcheck  = diplus > diminus and macdLine > signalLine and (not useCsFilter or csDir > 0) and (not useRbFilter or rbHeat > 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
+shortcheck = diminus > diplus and signalLine > macdLine and (not useCsFilter or csDir < 0) and (not useRbFilter or rbHeat < 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
+
+var int trade = 0
+trade := longcheck ? 1 : shortcheck ? -1 : trade
+longFlip  = trade == 1 and trade[1] != 1
+shortFlip = trade == -1 and trade[1] != -1
+
+// ретесты зоны-магнита
+retestFiltersOK = (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
+retestLongRaw   = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and retestFiltersOK
+retestShortRaw  = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and retestFiltersOK
+
+var int lastRetestLong  = -99999
+var int lastRetestShort = -99999
+retestLong = retestLongRaw and bar_index - lastRetestLong > retestCooldown
+if retestLong
+    lastRetestLong := bar_index
+retestShort = retestShortRaw and bar_index - lastRetestShort > retestCooldown
+if retestShort
+    lastRetestShort := bar_index
+
+// ре-вход после выбитого стопа: пробой экстремума N баров при живых условиях
+reBaseHigh = ta.highest(high, reentryLkb)[1]
+reBaseLow  = ta.lowest(low, reentryLkb)[1]
+reentryLongRaw  = useReentry and longcheck and csDir > 0 and close > reBaseHigh
+reentryShortRaw = useReentry and shortcheck and csDir < 0 and close < reBaseLow
+
+// ═════════════════════════ ИСПОЛНЕНИЕ ═════════════════════════
+flat = strategy.position_size == 0
+
+// ── боксы риска/прибыли, как в индикаторе ──
+var int   vtDir      = 0
+var int   vtEntryBar = 0
+var float vtEntry    = na
+var float vtSL       = na
+var float vtTP       = na
+var box   vtRiskBox   = na
+var box   vtRewardBox = na
+var label vtTPLbl     = na
+var label vtSLLbl     = na
+var vtHistBoxes = array.new<box>()
+
+// позиция закрылась (стоп/тейк/флип) — замораживаем боксы в бледную историю
+if vtDir != 0 and flat and bar_index > vtEntryBar
+    if not na(vtRiskBox)
+        box.set_right(vtRiskBox, bar_index)
+        box.set_right(vtRewardBox, bar_index)
+        box.set_bgcolor(vtRiskBox, color.new(color.red, 90))
+        box.set_bgcolor(vtRewardBox, color.new(color.green, 90))
+        box.set_border_color(vtRiskBox, color.new(color.red, 70))
+        box.set_border_color(vtRewardBox, color.new(color.green, 70))
+        box.set_border_width(vtRiskBox, 1)
+        box.set_border_width(vtRewardBox, 1)
+        array.push(vtHistBoxes, vtRiskBox)
+        array.push(vtHistBoxes, vtRewardBox)
+        while array.size(vtHistBoxes) > keepTrades * 2
+            box.delete(array.shift(vtHistBoxes))
+        label.delete(vtTPLbl)
+        label.delete(vtSLLbl)
+        vtRiskBox := box(na)
+    vtDir := 0
+
+// активная сделка — тянем боксы за правым краем
+if vtDir != 0 and not na(vtRiskBox)
+    box.set_right(vtRiskBox, bar_index + 4)
+    box.set_right(vtRewardBox, bar_index + 4)
+    label.set_x(vtTPLbl, bar_index + 4)
+    label.set_x(vtSLLbl, bar_index + 4)
+
+if flat and allowLong and (longFlip or (trackRetests and retestLong) or reentryLongRaw)
+    isReL = not (longFlip or (trackRetests and retestLong))
+    slL   = isReL ? reBaseLow : slMode == 'Zone edge' ? zoneBot : pc
+    riskL = close - slL
+    if riskL > 0
+        qtyL = strategy.equity * riskPct / 100 / riskL
+        strategy.entry('L', strategy.long, qty = qtyL, comment = isReL ? 'RE-L' : retestLong and trackRetests and not longFlip ? 'RT-L' : 'BUY')
+        strategy.exit('L exit', 'L', stop = slL, limit = close + rrMult * riskL)
+        vtDir := 1
+        vtEntry := close
+        vtSL := slL
+        vtTP := close + rrMult * riskL
+        vtEntryBar := bar_index
+        if showTpsl
+            vtRiskBox := box.new(bar_index, math.max(vtEntry, vtSL), bar_index + 4, math.min(vtEntry, vtSL), border_color = color.new(color.red, 35), border_width = 2, bgcolor = color.new(color.red, 78))
+            vtRewardBox := box.new(bar_index, math.max(vtEntry, vtTP), bar_index + 4, math.min(vtEntry, vtTP), border_color = color.new(color.green, 35), border_width = 2, bgcolor = color.new(color.green, 78))
+            vtTPLbl := label.new(bar_index + 4, vtTP, 'TP ' + str.tostring(vtTP, format.mintick), style = label.style_label_left, color = color.new(color.green, 15), textcolor = color.white, size = size.normal)
+            vtSLLbl := label.new(bar_index + 4, vtSL, 'SL ' + str.tostring(vtSL, format.mintick), style = label.style_label_left, color = color.new(color.red, 15), textcolor = color.white, size = size.normal)
+
+if flat and allowShort and (shortFlip or (trackRetests and retestShort) or reentryShortRaw)
+    isReS = not (shortFlip or (trackRetests and retestShort))
+    slS   = isReS ? reBaseHigh : slMode == 'Zone edge' ? zoneTop : pc
+    riskS = slS - close
+    if riskS > 0
+        qtyS = strategy.equity * riskPct / 100 / riskS
+        strategy.entry('S', strategy.short, qty = qtyS, comment = isReS ? 'RE-S' : retestShort and trackRetests and not shortFlip ? 'RT-S' : 'SELL')
+        strategy.exit('S exit', 'S', stop = slS, limit = close - rrMult * riskS)
+        vtDir := -1
+        vtEntry := close
+        vtSL := slS
+        vtTP := close - rrMult * riskS
+        vtEntryBar := bar_index
+        if showTpsl
+            vtRiskBox := box.new(bar_index, math.max(vtEntry, vtSL), bar_index + 4, math.min(vtEntry, vtSL), border_color = color.new(color.red, 35), border_width = 2, bgcolor = color.new(color.red, 78))
+            vtRewardBox := box.new(bar_index, math.max(vtEntry, vtTP), bar_index + 4, math.min(vtEntry, vtTP), border_color = color.new(color.green, 35), border_width = 2, bgcolor = color.new(color.green, 78))
+            vtTPLbl := label.new(bar_index + 4, vtTP, 'TP ' + str.tostring(vtTP, format.mintick), style = label.style_label_left, color = color.new(color.green, 15), textcolor = color.white, size = size.normal)
+            vtSLLbl := label.new(bar_index + 4, vtSL, 'SL ' + str.tostring(vtSL, format.mintick), style = label.style_label_left, color = color.new(color.red, 15), textcolor = color.white, size = size.normal)
+
+// досрочный выход по перевороту Chandelier
+if flipExit
+    if strategy.position_size > 0 and csDir < 0
+        strategy.close('L', comment = 'FLIP')
+    if strategy.position_size < 0 and csDir > 0
+        strategy.close('S', comment = 'FLIP')
+
+// ═════════════════════════ ЛЁГКАЯ ГРАФИКА ═════════════════════════
+csColor = csDir > 0 ? color.aqua : color.fuchsia
+plot(pc, title = 'Chandelier', color = csColor, linewidth = 2)
+ztP = plot(zoneTop, title = 'Zone Top', color = color.new(csColor, 70))
+zbP = plot(zoneBot, title = 'Zone Bottom', color = color.new(csColor, 70))
+fill(ztP, zbP, color = color.new(csColor, 88), title = 'Magnet Zone')
