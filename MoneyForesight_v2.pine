@@ -99,8 +99,11 @@ float rbSum = 0.0
 for i = 0 to rbLength - 1
     rbSum += rbSrc[i] * array.get(rbWeights, i)
 // при вырожденных весах (rbDen = 0) filt был бы na, и Rainbow-фильтр молча
-// гасил бы все сигналы — падаем на простую SMA вместо неопределённости
-filt = rbDen > 0 ? rbSum / rbDen : ta.sma(rbSrc, rbLength)
+// гасил бы все сигналы — падаем на простую SMA вместо неопределённости.
+// ta.sma вызывается безусловно: внутри тернарного оператора он считался бы не на
+// каждом баре и его внутреннее состояние разъезжалось бы (предупреждение Pine)
+rbFallback = ta.sma(rbSrc, rbLength)
+filt = rbDen > 0 ? rbSum / rbDen : rbFallback
 
 // тепло тренда: 0 = перепроданность (красный), 1 = сила (зелёный); до прогрева RSI — нейтральные 0.5
 rbHeat  = nz(ta.rsi(filt, rbLength), 50) / 100
