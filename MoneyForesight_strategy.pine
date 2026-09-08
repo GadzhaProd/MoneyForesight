@@ -18,7 +18,7 @@
 //     действительно равен заявленному проценту и на инструментах с pointvalue != 1
 //   • Rainbow: длина от 3 + фолбэк на SMA при вырожденных весах
 //@version=5
-strategy('MoneyForesight Strategy', overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, max_boxes_count = 100, max_labels_count = 500)
+strategy('MoneyForesight Strategy 1.1', overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, max_boxes_count = 100, max_labels_count = 500)
 
 // ═════════════════════════ НАСТРОЙКИ ═════════════════════════
 // Порядок групп = порядок важности. Ищем стратегию ТОЛЬКО ручками из группы «ГЛАВНОЕ»,
