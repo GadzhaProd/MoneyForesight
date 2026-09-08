@@ -35,7 +35,7 @@
 //   • цикл силы зон смотрит фиксированные 500 баров: на короткой истории
 //     na-бары безвредно игнорируются
 //@version=5
-indicator('MoneyForesight v2', overlay = true)
+indicator('MoneyForesight v2.1', overlay = true)
 
 // ═════════════════════════ 1 · CHANDELIER STOP ═════════════════════════
 g1 = '1 · Chandelier Stop'
