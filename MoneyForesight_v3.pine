@@ -43,6 +43,19 @@
 //     (или на линии), тейк = R × риск; линии уровней и метки исходов на графике,
 //     счёт TP/SL/флипов и winrate — в таблице статистики
 //
+// Исправления по код-ревью 2026-09-08 (docs/reviews/2026-09-08-code-review.md):
+//   • ре-вход теперь действительно «после стоп-аута»: взвод даёт только сработавший
+//     стоп и только в ту же сторону (раньше вход шёл после любого выхода)
+//   • S/R больше не роняет индикатор, когда в окне нет ни одного пивота
+//   • Rainbow: длина от 3 + фолбэк на SMA при вырожденных весах (был нулевой знаменатель)
+//   • грейд A/B считает риск до ФАКТИЧЕСКОГО стопа входа, а не всегда до линии
+//   • «Show Retest Entries» стал тумблером только отрисовки — расчёт ретестов,
+//     алерты и виртуальные входы больше от него не зависят
+//   • строки таблицы S/R гасятся перед перестроением; «цена внутри канала»
+//     больше не подписана как Support
+//   • строки статистики подписаны реальным предикатом фильтра, а не сравнением с порогом
+//   • «ход после отбоя» не засчитывает бар, на котором цена вернулась в зону
+//
 // Осознанно оставлено как в оригинале:
 //   • зоны S/R считаются только на последнем баре — исторических зон нет,
 //     бэктест по ним невозможен (архитектура исходного скрипта)
@@ -104,7 +117,7 @@ macdSource   = input.source(close, 'MACD Source', group = gTune)
 macdFast     = input.int(12, 'MACD Fast Length', minval = 1, group = gTune)
 macdSlow     = input.int(26, 'MACD Slow Length', minval = 1, group = gTune)
 macdSig      = input.int(9, 'MACD Signal Length', minval = 1, group = gTune)
-rbLength     = input.int(50, 'Rainbow Length', minval = 2, group = gTune)
+rbLength     = input.int(50, 'Rainbow Length', minval = 3, group = gTune, tooltip = 'Минимум 3: при длине 2 бета-веса вырождаются в [0, 0] и линия становится неопределённой.')
 rbAlpha      = input.float(3.0, 'Rainbow +Lag (alpha)', minval = 1, maxval = 10, group = gTune)
 rbBeta       = input.float(3.0, 'Rainbow -Lag (beta)', minval = 1, maxval = 10, group = gTune)
 rbSrc        = input.source(close, 'Rainbow Source', group = gTune)
@@ -181,7 +194,9 @@ rbDen = array.sum(rbWeights)
 float rbSum = 0.0
 for i = 0 to rbLength - 1
     rbSum += rbSrc[i] * array.get(rbWeights, i)
-filt = rbSum / rbDen
+// при вырожденных весах (rbDen = 0) filt был бы na, и Rainbow-фильтр молча
+// гасил бы все сигналы — падаем на простую SMA вместо неопределённости
+filt = rbDen > 0 ? rbSum / rbDen : ta.sma(rbSrc, rbLength)
 
 // тепло тренда: 0 = перепроданность (красный), 1 = сила (зелёный); до прогрева RSI — нейтральные 0.5
 rbHeat  = nz(ta.rsi(filt, rbLength), 50) / 100
@@ -309,124 +324,144 @@ supportbroken = false
 var bool srNearRes = false
 var bool srNearSup = false
 
+// таблица и боксы объявлены вне блока: они нужны и когда пивотов не нашлось
+var srtable = table.new(position = tableposy + '_' + tableposx, columns = 5, rows = 11, frame_width = 1, frame_color = color.gray, border_width = 1, border_color = color.gray)
+var srchannels = array.new_box(10)
+
 // calculate S/R on last bar
 if barstate.islast
     pivotvals = get_pivotvals(hlmatrix)
 
-    // calculate maximum S/R channel width
-    prdhighest = array.max(pivotvals)
-    prdlowest  = array.min(pivotvals)
-    cwidth = (prdhighest - prdlowest) * ChannelW / 100
+    // находка №5: выбранное окно может не содержать ни одного подтверждённого
+    // пивота. array.max/min на пустом массиве роняют ВЕСЬ индикатор, а проверка
+    // matrix.rows() выше не спасает — матрица преаллоцирована нулями
+    if array.size(pivotvals) == 0
+        array.fill(srLevels, 0)
+        for x = 0 to 9
+            box.delete(array.get(srchannels, x))
+        if showtable
+            for r = 1 to 10
+                for col = 0 to 3
+                    table.cell(srtable, col, r, '', bgcolor = na)
+    else
 
-    supres = array.new_float(0) // strength, hi, lo per pivot
-    srStren = array.new_float(10, 0)
-    // get levels and strengths
-    for x = 0 to array.size(pivotvals) - 1
-        [hi, lo, strength] = get_sr_vals(pivotvals, cwidth, x)
-        array.push(supres, strength)
-        array.push(supres, hi)
-        array.push(supres, lo)
+        // calculate maximum S/R channel width
+        prdhighest = array.max(pivotvals)
+        prdlowest  = array.min(pivotvals)
+        cwidth = (prdhighest - prdlowest) * ChannelW / 100
 
-    // check last 500 bars on current time frame and add each OHLC touch to strength
-    for x = 0 to array.size(pivotvals) - 1
-        h = array.get(supres, x * 3 + 1)
-        l = array.get(supres, x * 3 + 2)
-        s = 0
-        for y = 0 to 499
-            if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l) or (open[y] <= h and open[y] >= l) or (close[y] <= h and close[y] >= l)
-                s := s + 1
-        array.set(supres, x * 3, array.get(supres, x * 3) + s)
+        supres = array.new_float(0) // strength, hi, lo per pivot
+        srStren = array.new_float(10, 0)
+        // get levels and strengths
+        for x = 0 to array.size(pivotvals) - 1
+            [hi, lo, strength] = get_sr_vals(pivotvals, cwidth, x)
+            array.push(supres, strength)
+            array.push(supres, hi)
+            array.push(supres, lo)
 
-    // reset SR levels
-    array.fill(srLevels, 0)
-    // get strongest SRs
-    srCount = 0
-    for x = 0 to array.size(pivotvals) - 1
-        stv = -1. // value
-        stl = -1  // location
-        for y = 0 to array.size(pivotvals) - 1
-            if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minstrength * 20
-                stv := array.get(supres, y * 3)
-                stl := y
-        if stl >= 0
-            // get sr level
-            hh = array.get(supres, stl * 3 + 1)
-            ll = array.get(supres, stl * 3 + 2)
-            array.set(srLevels, srCount * 2, hh)
-            array.set(srLevels, srCount * 2 + 1, ll)
-            array.set(srStren, srCount, array.get(supres, stl * 3))
+        // check last 500 bars on current time frame and add each OHLC touch to strength
+        for x = 0 to array.size(pivotvals) - 1
+            h = array.get(supres, x * 3 + 1)
+            l = array.get(supres, x * 3 + 2)
+            s = 0
+            for y = 0 to 499
+                if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l) or (open[y] <= h and open[y] >= l) or (close[y] <= h and close[y] >= l)
+                    s := s + 1
+            array.set(supres, x * 3, array.get(supres, x * 3) + s)
 
-            // make included pivot points' strength zero
+        // reset SR levels
+        array.fill(srLevels, 0)
+        // get strongest SRs
+        srCount = 0
+        for x = 0 to array.size(pivotvals) - 1
+            stv = -1. // value
+            stl = -1  // location
             for y = 0 to array.size(pivotvals) - 1
-                if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
-                    array.set(supres, y * 3, -1)
+                if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minstrength * 20
+                    stv := array.get(supres, y * 3)
+                    stl := y
+            if stl >= 0
+                // get sr level
+                hh = array.get(supres, stl * 3 + 1)
+                ll = array.get(supres, stl * 3 + 2)
+                array.set(srLevels, srCount * 2, hh)
+                array.set(srLevels, srCount * 2 + 1, ll)
+                array.set(srStren, srCount, array.get(supres, stl * 3))
 
-            srCount += 1
-            if srCount >= 10
-                break
+                // make included pivot points' strength zero
+                for y = 0 to array.size(pivotvals) - 1
+                    if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
+                        array.set(supres, y * 3, -1)
 
-    // sort S/R according to their strengths
-    for x = 0 to 8
-        for y = x + 1 to 9
-            if array.get(srStren, y) > array.get(srStren, x)
-                tmp = array.get(srStren, y)
-                array.set(srStren, y, array.get(srStren, x))
-                array.set(srStren, x, tmp)
-                swapLevels(srLevels, x, y)
+                srCount += 1
+                if srCount >= 10
+                    break
 
-    var srtable = table.new(position = tableposy + '_' + tableposx, columns = 5, rows = 11, frame_width = 1, frame_color = color.gray, border_width = 1, border_color = color.gray)
-    if showtable
-        table.cell(srtable, 0, 0, text = 'TF:' + srTF + ' Sorted by the Strength MoneyForesight ', text_color = color.rgb(230, 20, 100), bgcolor = color.yellow)
-        table.merge_cells(srtable, 0, 0, 3, 0)
+        // sort S/R according to their strengths
+        for x = 0 to 8
+            for y = x + 1 to 9
+                if array.get(srStren, y) > array.get(srStren, x)
+                    tmp = array.get(srStren, y)
+                    array.set(srStren, y, array.get(srStren, x))
+                    array.set(srStren, x, tmp)
+                    swapLevels(srLevels, x, y)
 
-    // show S/R channels and table rows if enabled
-    var srchannels = array.new_box(10)
-    rowindex = 1
-    for x = 0 to math.min(9, maxnumsr)
-        box.delete(array.get(srchannels, x))
-        srcol = get_color(srLevels, x * 2)
-        if not na(srcol)
-            if not showsrfit or (get_level(srLevels, x * 2 + 1) <= chart_highest and get_level(srLevels, x * 2) >= chart_lowest)
-                array.set(srchannels, x, box.new(left = math.max(bar_index - 300, 0), top = get_level(srLevels, x * 2), right = bar_index + 1, bottom = get_level(srLevels, x * 2 + 1), border_color = srcol, border_width = 1, extend = extend.both, bgcolor = srcol))
-            if showtable
-                srtext = srcol == res_col ? 'Resistance' : 'Support'
-                bgcol  = srcol == res_col ? color.rgb(200, 0, 0) : color.rgb(0, 200, 0)
-                txtcol = srcol == res_col ? color.white : color.black
-                table.cell(table_id = srtable, column = 0, row = rowindex, text = str.tostring(rowindex), text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 1, row = rowindex, text = srtext, text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 2, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2 + 1))), text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 3, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2))), text_color = txtcol, bgcolor = bgcol)
-                rowindex += 1
+        // строки гасим перед перестроением: иначе при уменьшении числа каналов
+        // на экране остаются строки с ценами уже удалённых зон
+        if showtable
+            table.cell(srtable, 0, 0, text = 'TF:' + srTF + ' Sorted by the Strength MoneyForesight ', text_color = color.rgb(230, 20, 100), bgcolor = color.yellow)
+            table.merge_cells(srtable, 0, 0, 3, 0)
+            for r = 1 to 10
+                for col = 0 to 3
+                    table.cell(srtable, col, r, '', bgcolor = na)
 
-    // alerts: check if the price is not in a channel
-    not_in_a_channel = true
-    for x = 0 to math.min(9, maxnumsr)
-        if close <= array.get(srLevels, x * 2) and close >= array.get(srLevels, x * 2 + 1)
-            not_in_a_channel := false
-
-    // if price is not in a channel then check if S/R was broken
-    if not_in_a_channel
+        // show S/R channels and table rows if enabled
+        rowindex = 1
         for x = 0 to math.min(9, maxnumsr)
-            if close[1] <= array.get(srLevels, x * 2) and close > array.get(srLevels, x * 2)
-                resistancebroken := true
-            if close[1] >= array.get(srLevels, x * 2 + 1) and close < array.get(srLevels, x * 2 + 1)
-                supportbroken := true
+            box.delete(array.get(srchannels, x))
+            srcol = get_color(srLevels, x * 2)
+            if not na(srcol)
+                if not showsrfit or (get_level(srLevels, x * 2 + 1) <= chart_highest and get_level(srLevels, x * 2) >= chart_lowest)
+                    array.set(srchannels, x, box.new(left = math.max(bar_index - 300, 0), top = get_level(srLevels, x * 2), right = bar_index + 1, bottom = get_level(srLevels, x * 2 + 1), border_color = srcol, border_width = 1, extend = extend.both, bgcolor = srcol))
+                if showtable
+                    srtext = srcol == res_col ? 'Resistance' : srcol == sup_col ? 'Support' : 'In channel'
+                    bgcol  = srcol == res_col ? color.rgb(200, 0, 0) : srcol == sup_col ? color.rgb(0, 200, 0) : color.rgb(110, 110, 110)
+                    txtcol = srcol == sup_col ? color.black : color.white
+                    table.cell(table_id = srtable, column = 0, row = rowindex, text = str.tostring(rowindex), text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 1, row = rowindex, text = srtext, text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 2, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2 + 1))), text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 3, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2))), text_color = txtcol, bgcolor = bgcol)
+                    rowindex += 1
 
-    // Confluence: цена внутри зоны или в пределах буфера от неё
-    srNearRes := false
-    srNearSup := false
-    if useSrFilter
+        // alerts: check if the price is not in a channel
+        not_in_a_channel = true
         for x = 0 to math.min(9, maxnumsr)
-            zTop = array.get(srLevels, x * 2)
-            zBot = array.get(srLevels, x * 2 + 1)
-            if zTop != 0
-                if close <= zTop and close >= zBot // внутри зоны — блокируем оба направления
-                    srNearRes := true
-                    srNearSup := true
-                if zBot > close and zBot - close <= atr14 * srBuffer // сопротивление прямо над ценой
-                    srNearRes := true
-                if zTop < close and close - zTop <= atr14 * srBuffer // поддержка прямо под ценой
-                    srNearSup := true
+            if close <= array.get(srLevels, x * 2) and close >= array.get(srLevels, x * 2 + 1)
+                not_in_a_channel := false
+
+        // if price is not in a channel then check if S/R was broken
+        if not_in_a_channel
+            for x = 0 to math.min(9, maxnumsr)
+                if close[1] <= array.get(srLevels, x * 2) and close > array.get(srLevels, x * 2)
+                    resistancebroken := true
+                if close[1] >= array.get(srLevels, x * 2 + 1) and close < array.get(srLevels, x * 2 + 1)
+                    supportbroken := true
+
+        // Confluence: цена внутри зоны или в пределах буфера от неё
+        srNearRes := false
+        srNearSup := false
+        if useSrFilter
+            for x = 0 to math.min(9, maxnumsr)
+                zTop = array.get(srLevels, x * 2)
+                zBot = array.get(srLevels, x * 2 + 1)
+                if zTop != 0
+                    if close <= zTop and close >= zBot // внутри зоны — блокируем оба направления
+                        srNearRes := true
+                        srNearSup := true
+                    if zBot > close and zBot - close <= atr14 * srBuffer // сопротивление прямо над ценой
+                        srNearRes := true
+                    if zTop < close and close - zTop <= atr14 * srBuffer // поддержка прямо под ценой
+                        srNearSup := true
 
 // ═════════════════════════ СИГНАЛЫ И АЛЕРТЫ ═════════════════════════
 confirmOK = not waitForClose or barstate.isconfirmed
@@ -436,10 +471,14 @@ shortFlip = trade == -1 and trade[1] != -1
 longSignal  = longFlip and confirmOK and (not useSrFilter or not srNearRes)
 shortSignal = shortFlip and confirmOK and (not useSrFilter or not srNearSup)
 
-// ── грейд сигнала: стоп всегда на линии Chandelier, значит расстояние до неё = риск ──
-// отрицательный риск (стоп не с той стороны — линия против сделки) и na-прогрев уходят в сорт B
-riskLongATR  = nz((close - pc) / csATR, 999)
-riskShortATR = nz((pc - close) / csATR, 999)
+// ── грейд сигнала: риск = расстояние до ТОГО ЖЕ стопа, который поставит вход ──
+// (раньше грейд всегда мерил до линии Chandelier и при стопе «Zone edge» занижал
+// риск на zoneMult × ATR, помечая сортом A сделки за порогом gradeMaxRisk);
+// отрицательный риск (стоп не с той стороны) и na-прогрев уходят в сорт B
+gradeStopLong  = slMode == 'Zone edge' ? zoneBot : pc
+gradeStopShort = slMode == 'Zone edge' ? zoneTop : pc
+riskLongATR  = nz((close - gradeStopLong) / csATR, 999)
+riskShortATR = nz((gradeStopShort - close) / csATR, 999)
 longRiskOK   = riskLongATR >= 0 and riskLongATR <= gradeMaxRisk
 shortRiskOK  = riskShortATR >= 0 and riskShortATR <= gradeMaxRisk
 longSignalA  = longSignal and longRiskOK
@@ -450,9 +489,11 @@ shortSignalB = shortSignal and not shortRiskOK
 // ── ретест-входы: откат в зону-магнит в живом тренде, закрытие обратно за зоной ──
 // бар переворота исключён (csDir[1] в ту же сторону); два паттерна: тень в зону с закрытием
 // за ней (same-bar отбой) или возврат после закрытий внутри зоны (reclaim)
+// showRetest сюда НЕ входит: это тумблер отрисовки, а не расчёта — иначе он
+// заодно выключал бы ретест-алерты и виртуальные входы при включённом «Enter on Retests Too»
 retestFiltersOK = (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
-retestLongRaw  = showRetest and csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and retestFiltersOK and confirmOK
-retestShortRaw = showRetest and csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and retestFiltersOK and confirmOK
+retestLongRaw  = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and retestFiltersOK and confirmOK
+retestShortRaw = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and retestFiltersOK and confirmOK
 
 var int lastRetestLong  = -99999
 var int lastRetestShort = -99999
@@ -488,12 +529,15 @@ var int   excCntTrend = 0
 var float excSumFlat  = 0.0
 var int   excCntFlat  = 0
 
-if excDir == 1
-    excExtreme := math.max(excExtreme, high)
-if excDir == -1
-    excExtreme := math.min(excExtreme, low)
+// порядок важен: сначала проверяем завершение забега и только потом обновляем
+// экстремум. Иначе бар, который одновременно поставил новый максимум и вернулся
+// в зону, засчитывал бы этот максимум — по OHLC нельзя сказать, что случилось
+// раньше, поэтому берём консервативное допущение «возврат в зону был первым»
 excTouchBack = excDir == 1 ? low <= zoneTop : excDir == -1 ? high >= zoneBot : false
-if excDir != 0 and (flipToLong or flipToShort or excTouchBack)
+excEnding    = excDir != 0 and (flipToLong or flipToShort or excTouchBack)
+if excDir != 0 and not excEnding
+    excExtreme := excDir == 1 ? math.max(excExtreme, high) : math.min(excExtreme, low)
+if excEnding
     excPct = excDir == 1 ? (excExtreme - excAnchor) / excAnchor * 100 : (excAnchor - excExtreme) / excAnchor * 100
     if excRegime
         excSumTrend += excPct
@@ -563,10 +607,16 @@ else
 
 // ── ре-вход после выбитого стопа: условия направления держатся, цена пробивает
 // экстремум последних N баров — повторный вход по тренду, стоп под базой пробоя ──
+// взвод: только выбитый стоп открывает право на повторный вход, и только в ту же
+// сторону. Без этого «ре-вход после стоп-аута» срабатывал и после тейка, и после
+// флип-выхода — то есть после любого периода без позиции
+var bool reArmLong  = false
+var bool reArmShort = false
+
 reBaseHigh = ta.highest(high, reentryLkb)[1]
 reBaseLow  = ta.lowest(low, reentryLkb)[1]
-reentryLongRaw  = useReentry and longcheck and csDir > 0 and close > reBaseHigh and confirmOK
-reentryShortRaw = useReentry and shortcheck and csDir < 0 and close < reBaseLow and confirmOK
+reentryLongRaw  = useReentry and reArmLong and longcheck and csDir > 0 and close > reBaseHigh and confirmOK
+reentryShortRaw = useReentry and reArmShort and shortcheck and csDir < 0 and close < reBaseLow and confirmOK
 reentryLongSig  = false
 reentryShortSig = false
 
@@ -604,6 +654,7 @@ if vtDir == 1 and bar_index > vtEntryBar
         if exitSL
             vtLosses += 1
             vtSlHitEvt := true
+            reArmLong := true
         if exitTP
             vtWins += 1
             vtTpHitEvt := true
@@ -635,6 +686,7 @@ else if vtDir == -1 and bar_index > vtEntryBar
         if exitSLs
             vtLosses += 1
             vtSlHitEvt := true
+            reArmShort := true
         if exitTPs
             vtWins += 1
             vtTpHitEvt := true
@@ -667,6 +719,7 @@ if vtDir == 0
         riskL  = close - slLvlL
         if riskL > 0
             reentryLongSig := isReL
+            reArmLong := false
             vtDir := 1
             vtEntry := close
             vtSL := slLvlL
@@ -683,6 +736,7 @@ if vtDir == 0
         riskS  = slLvlS - close
         if riskS > 0
             reentryShortSig := isReS
+            reArmShort := false
             vtDir := -1
             vtEntry := close
             vtSL := slLvlS
@@ -702,15 +756,17 @@ if showStats and barstate.islast
     flatPct  = totFlat > 0 ? ' (' + str.tostring(math.round(100.0 * bncFlat / totFlat)) + '%)' : ''
     avgTrend = excCntTrend > 0 ? str.tostring(excSumTrend / excCntTrend, '#.##') + '%' : '—'
     avgFlat  = excCntFlat > 0 ? str.tostring(excSumFlat / excCntFlat, '#.##') + '%' : '—'
-    table.cell(statsTbl, 0, 0, 'Зона-магнит', text_color = color.white, bgcolor = color.rgb(60, 60, 60))
+    // классификация идёт по adxOK (он же пускает сделки), а он принимает и растущий
+    // ADX от половины порога — поэтому строки подписаны фильтром, а не сравнением с порогом
+    table.cell(statsTbl, 0, 0, 'Зона-магнит · ADX ' + str.tostring(adxThreshold, '#.#'), text_color = color.white, bgcolor = color.rgb(60, 60, 60))
     table.cell(statsTbl, 1, 0, 'Отбой', text_color = color.white, bgcolor = color.rgb(60, 60, 60))
     table.cell(statsTbl, 2, 0, 'Пробой', text_color = color.white, bgcolor = color.rgb(60, 60, 60))
     table.cell(statsTbl, 3, 0, 'Ср. ход после отбоя', text_color = color.white, bgcolor = color.rgb(60, 60, 60))
-    table.cell(statsTbl, 0, 1, 'Тренд (ADX>=' + str.tostring(adxThreshold, '#.#') + ')', text_color = color.black, bgcolor = color.rgb(0, 200, 0))
+    table.cell(statsTbl, 0, 1, 'Тренд (ADX-фильтр пройден)', text_color = color.black, bgcolor = color.rgb(0, 200, 0))
     table.cell(statsTbl, 1, 1, str.tostring(bncTrend) + trendPct, text_color = color.black, bgcolor = color.rgb(0, 200, 0))
     table.cell(statsTbl, 2, 1, str.tostring(brkTrend), text_color = color.black, bgcolor = color.rgb(0, 200, 0))
     table.cell(statsTbl, 3, 1, avgTrend, text_color = color.black, bgcolor = color.rgb(0, 200, 0))
-    table.cell(statsTbl, 0, 2, 'Боковик (ADX<' + str.tostring(adxThreshold, '#.#') + ')', text_color = color.white, bgcolor = color.rgb(90, 90, 90))
+    table.cell(statsTbl, 0, 2, 'Боковик (фильтр не пройден)', text_color = color.white, bgcolor = color.rgb(90, 90, 90))
     table.cell(statsTbl, 1, 2, str.tostring(bncFlat) + flatPct, text_color = color.white, bgcolor = color.rgb(90, 90, 90))
     table.cell(statsTbl, 2, 2, str.tostring(brkFlat), text_color = color.white, bgcolor = color.rgb(90, 90, 90))
     table.cell(statsTbl, 3, 2, avgFlat, text_color = color.white, bgcolor = color.rgb(90, 90, 90))
@@ -727,8 +783,8 @@ plotshape(showsignals and longSignalA, title = 'BUY (A)', style = shape.labelup,
 plotshape(showsignals and longSignalB, title = 'BUY (B)', style = shape.labelup, text = 'BUY', textcolor = color.white, color = color.new(color.green, 45), size = size.tiny, location = location.belowbar)
 plotshape(showsignals and shortSignalA, title = 'SELL (A)', style = shape.labeldown, text = 'SELL', textcolor = color.white, color = color.red, size = size.small, location = location.abovebar)
 plotshape(showsignals and shortSignalB, title = 'SELL (B)', style = shape.labeldown, text = 'SELL', textcolor = color.white, color = color.new(color.red, 45), size = size.tiny, location = location.abovebar)
-plotshape(retestLong, title = 'Retest Long', style = shape.triangleup, color = color.aqua, size = size.tiny, location = location.belowbar)
-plotshape(retestShort, title = 'Retest Short', style = shape.triangledown, color = color.fuchsia, size = size.tiny, location = location.abovebar)
+plotshape(showRetest and retestLong, title = 'Retest Long', style = shape.triangleup, color = color.aqua, size = size.tiny, location = location.belowbar)
+plotshape(showRetest and retestShort, title = 'Retest Short', style = shape.triangledown, color = color.fuchsia, size = size.tiny, location = location.abovebar)
 plotshape(reentryLongSig, title = 'Re-Entry Long', style = shape.diamond, color = color.aqua, size = size.tiny, location = location.belowbar)
 plotshape(reentryShortSig, title = 'Re-Entry Short', style = shape.diamond, color = color.fuchsia, size = size.tiny, location = location.abovebar)
 

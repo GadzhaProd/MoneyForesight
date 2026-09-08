@@ -83,7 +83,7 @@ plot(ta.ema(ema3Src, ema3Len), title = 'EMA 9', color = color.purple, offset = e
 
 // ═════════════════════════ 3 · RAINBOW MA ═════════════════════════
 g3 = '3 · Rainbow MA'
-rbLength = input.int(50, 'Length', minval = 2, group = g3)
+rbLength = input.int(50, 'Length', minval = 3, group = g3, tooltip = 'Минимум 3: при длине 2 бета-веса вырождаются в [0, 0] и линия становится неопределённой.')
 rbAlpha  = input.float(3.0, '+Lag (alpha)', minval = 1, maxval = 10, group = g3)
 rbBeta   = input.float(3.0, '-Lag (beta)', minval = 1, maxval = 10, group = g3)
 rbSrc    = input.source(close, 'Source', group = g3)
@@ -98,7 +98,9 @@ rbDen = array.sum(rbWeights)
 float rbSum = 0.0
 for i = 0 to rbLength - 1
     rbSum += rbSrc[i] * array.get(rbWeights, i)
-filt = rbSum / rbDen
+// при вырожденных весах (rbDen = 0) filt был бы na, и Rainbow-фильтр молча
+// гасил бы все сигналы — падаем на простую SMA вместо неопределённости
+filt = rbDen > 0 ? rbSum / rbDen : ta.sma(rbSrc, rbLength)
 
 // тепло тренда: 0 = перепроданность (красный), 1 = сила (зелёный); до прогрева RSI — нейтральные 0.5
 rbHeat  = nz(ta.rsi(filt, rbLength), 50) / 100
@@ -257,124 +259,144 @@ supportbroken = false
 var bool srNearRes = false
 var bool srNearSup = false
 
+// таблица и боксы объявлены вне блока: они нужны и когда пивотов не нашлось
+var srtable = table.new(position = tableposy + '_' + tableposx, columns = 5, rows = 11, frame_width = 1, frame_color = color.gray, border_width = 1, border_color = color.gray)
+var srchannels = array.new_box(10)
+
 // calculate S/R on last bar
 if barstate.islast
     pivotvals = get_pivotvals(hlmatrix)
 
-    // calculate maximum S/R channel width
-    prdhighest = array.max(pivotvals)
-    prdlowest  = array.min(pivotvals)
-    cwidth = (prdhighest - prdlowest) * ChannelW / 100
+    // находка №5: выбранное окно может не содержать ни одного подтверждённого
+    // пивота. array.max/min на пустом массиве роняют ВЕСЬ индикатор, а проверка
+    // matrix.rows() выше не спасает — матрица преаллоцирована нулями
+    if array.size(pivotvals) == 0
+        array.fill(srLevels, 0)
+        for x = 0 to 9
+            box.delete(array.get(srchannels, x))
+        if showtable
+            for r = 1 to 10
+                for col = 0 to 3
+                    table.cell(srtable, col, r, '', bgcolor = na)
+    else
 
-    supres = array.new_float(0) // strength, hi, lo per pivot
-    srStren = array.new_float(10, 0)
-    // get levels and strengths
-    for x = 0 to array.size(pivotvals) - 1
-        [hi, lo, strength] = get_sr_vals(pivotvals, cwidth, x)
-        array.push(supres, strength)
-        array.push(supres, hi)
-        array.push(supres, lo)
+        // calculate maximum S/R channel width
+        prdhighest = array.max(pivotvals)
+        prdlowest  = array.min(pivotvals)
+        cwidth = (prdhighest - prdlowest) * ChannelW / 100
 
-    // check last 500 bars on current time frame and add each OHLC touch to strength
-    for x = 0 to array.size(pivotvals) - 1
-        h = array.get(supres, x * 3 + 1)
-        l = array.get(supres, x * 3 + 2)
-        s = 0
-        for y = 0 to 499
-            if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l) or (open[y] <= h and open[y] >= l) or (close[y] <= h and close[y] >= l)
-                s := s + 1
-        array.set(supres, x * 3, array.get(supres, x * 3) + s)
+        supres = array.new_float(0) // strength, hi, lo per pivot
+        srStren = array.new_float(10, 0)
+        // get levels and strengths
+        for x = 0 to array.size(pivotvals) - 1
+            [hi, lo, strength] = get_sr_vals(pivotvals, cwidth, x)
+            array.push(supres, strength)
+            array.push(supres, hi)
+            array.push(supres, lo)
 
-    // reset SR levels
-    array.fill(srLevels, 0)
-    // get strongest SRs
-    srCount = 0
-    for x = 0 to array.size(pivotvals) - 1
-        stv = -1. // value
-        stl = -1  // location
-        for y = 0 to array.size(pivotvals) - 1
-            if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minstrength * 20
-                stv := array.get(supres, y * 3)
-                stl := y
-        if stl >= 0
-            // get sr level
-            hh = array.get(supres, stl * 3 + 1)
-            ll = array.get(supres, stl * 3 + 2)
-            array.set(srLevels, srCount * 2, hh)
-            array.set(srLevels, srCount * 2 + 1, ll)
-            array.set(srStren, srCount, array.get(supres, stl * 3))
+        // check last 500 bars on current time frame and add each OHLC touch to strength
+        for x = 0 to array.size(pivotvals) - 1
+            h = array.get(supres, x * 3 + 1)
+            l = array.get(supres, x * 3 + 2)
+            s = 0
+            for y = 0 to 499
+                if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l) or (open[y] <= h and open[y] >= l) or (close[y] <= h and close[y] >= l)
+                    s := s + 1
+            array.set(supres, x * 3, array.get(supres, x * 3) + s)
 
-            // make included pivot points' strength zero
+        // reset SR levels
+        array.fill(srLevels, 0)
+        // get strongest SRs
+        srCount = 0
+        for x = 0 to array.size(pivotvals) - 1
+            stv = -1. // value
+            stl = -1  // location
             for y = 0 to array.size(pivotvals) - 1
-                if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
-                    array.set(supres, y * 3, -1)
+                if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minstrength * 20
+                    stv := array.get(supres, y * 3)
+                    stl := y
+            if stl >= 0
+                // get sr level
+                hh = array.get(supres, stl * 3 + 1)
+                ll = array.get(supres, stl * 3 + 2)
+                array.set(srLevels, srCount * 2, hh)
+                array.set(srLevels, srCount * 2 + 1, ll)
+                array.set(srStren, srCount, array.get(supres, stl * 3))
 
-            srCount += 1
-            if srCount >= 10
-                break
+                // make included pivot points' strength zero
+                for y = 0 to array.size(pivotvals) - 1
+                    if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
+                        array.set(supres, y * 3, -1)
 
-    // sort S/R according to their strengths
-    for x = 0 to 8
-        for y = x + 1 to 9
-            if array.get(srStren, y) > array.get(srStren, x)
-                tmp = array.get(srStren, y)
-                array.set(srStren, y, array.get(srStren, x))
-                array.set(srStren, x, tmp)
-                swapLevels(srLevels, x, y)
+                srCount += 1
+                if srCount >= 10
+                    break
 
-    var srtable = table.new(position = tableposy + '_' + tableposx, columns = 5, rows = 11, frame_width = 1, frame_color = color.gray, border_width = 1, border_color = color.gray)
-    if showtable
-        table.cell(srtable, 0, 0, text = 'TF:' + srTF + ' Sorted by the Strength MoneyForesight ', text_color = color.rgb(230, 20, 100), bgcolor = color.yellow)
-        table.merge_cells(srtable, 0, 0, 3, 0)
+        // sort S/R according to their strengths
+        for x = 0 to 8
+            for y = x + 1 to 9
+                if array.get(srStren, y) > array.get(srStren, x)
+                    tmp = array.get(srStren, y)
+                    array.set(srStren, y, array.get(srStren, x))
+                    array.set(srStren, x, tmp)
+                    swapLevels(srLevels, x, y)
 
-    // show S/R channels and table rows if enabled
-    var srchannels = array.new_box(10)
-    rowindex = 1
-    for x = 0 to math.min(9, maxnumsr)
-        box.delete(array.get(srchannels, x))
-        srcol = get_color(srLevels, x * 2)
-        if not na(srcol)
-            if not showsrfit or (get_level(srLevels, x * 2 + 1) <= chart_highest and get_level(srLevels, x * 2) >= chart_lowest)
-                array.set(srchannels, x, box.new(left = math.max(bar_index - 300, 0), top = get_level(srLevels, x * 2), right = bar_index + 1, bottom = get_level(srLevels, x * 2 + 1), border_color = srcol, border_width = 1, extend = extend.both, bgcolor = srcol))
-            if showtable
-                srtext = srcol == res_col ? 'Resistance' : 'Support'
-                bgcol  = srcol == res_col ? color.rgb(200, 0, 0) : color.rgb(0, 200, 0)
-                txtcol = srcol == res_col ? color.white : color.black
-                table.cell(table_id = srtable, column = 0, row = rowindex, text = str.tostring(rowindex), text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 1, row = rowindex, text = srtext, text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 2, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2 + 1))), text_color = txtcol, bgcolor = bgcol)
-                table.cell(table_id = srtable, column = 3, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2))), text_color = txtcol, bgcolor = bgcol)
-                rowindex += 1
+        // строки гасим перед перестроением: иначе при уменьшении числа каналов
+        // на экране остаются строки с ценами уже удалённых зон
+        if showtable
+            table.cell(srtable, 0, 0, text = 'TF:' + srTF + ' Sorted by the Strength MoneyForesight ', text_color = color.rgb(230, 20, 100), bgcolor = color.yellow)
+            table.merge_cells(srtable, 0, 0, 3, 0)
+            for r = 1 to 10
+                for col = 0 to 3
+                    table.cell(srtable, col, r, '', bgcolor = na)
 
-    // alerts: check if the price is not in a channel
-    not_in_a_channel = true
-    for x = 0 to math.min(9, maxnumsr)
-        if close <= array.get(srLevels, x * 2) and close >= array.get(srLevels, x * 2 + 1)
-            not_in_a_channel := false
-
-    // if price is not in a channel then check if S/R was broken
-    if not_in_a_channel
+        // show S/R channels and table rows if enabled
+        rowindex = 1
         for x = 0 to math.min(9, maxnumsr)
-            if close[1] <= array.get(srLevels, x * 2) and close > array.get(srLevels, x * 2)
-                resistancebroken := true
-            if close[1] >= array.get(srLevels, x * 2 + 1) and close < array.get(srLevels, x * 2 + 1)
-                supportbroken := true
+            box.delete(array.get(srchannels, x))
+            srcol = get_color(srLevels, x * 2)
+            if not na(srcol)
+                if not showsrfit or (get_level(srLevels, x * 2 + 1) <= chart_highest and get_level(srLevels, x * 2) >= chart_lowest)
+                    array.set(srchannels, x, box.new(left = math.max(bar_index - 300, 0), top = get_level(srLevels, x * 2), right = bar_index + 1, bottom = get_level(srLevels, x * 2 + 1), border_color = srcol, border_width = 1, extend = extend.both, bgcolor = srcol))
+                if showtable
+                    srtext = srcol == res_col ? 'Resistance' : srcol == sup_col ? 'Support' : 'In channel'
+                    bgcol  = srcol == res_col ? color.rgb(200, 0, 0) : srcol == sup_col ? color.rgb(0, 200, 0) : color.rgb(110, 110, 110)
+                    txtcol = srcol == sup_col ? color.black : color.white
+                    table.cell(table_id = srtable, column = 0, row = rowindex, text = str.tostring(rowindex), text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 1, row = rowindex, text = srtext, text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 2, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2 + 1))), text_color = txtcol, bgcolor = bgcol)
+                    table.cell(table_id = srtable, column = 3, row = rowindex, text = str.tostring(math.round_to_mintick(get_level(srLevels, x * 2))), text_color = txtcol, bgcolor = bgcol)
+                    rowindex += 1
 
-    // Confluence: цена внутри зоны или в пределах буфера от неё
-    srNearRes := false
-    srNearSup := false
-    if useSrFilter
+        // alerts: check if the price is not in a channel
+        not_in_a_channel = true
         for x = 0 to math.min(9, maxnumsr)
-            zTop = array.get(srLevels, x * 2)
-            zBot = array.get(srLevels, x * 2 + 1)
-            if zTop != 0
-                if close <= zTop and close >= zBot // внутри зоны — блокируем оба направления
-                    srNearRes := true
-                    srNearSup := true
-                if zBot > close and zBot - close <= atr14 * srBuffer // сопротивление прямо над ценой
-                    srNearRes := true
-                if zTop < close and close - zTop <= atr14 * srBuffer // поддержка прямо под ценой
-                    srNearSup := true
+            if close <= array.get(srLevels, x * 2) and close >= array.get(srLevels, x * 2 + 1)
+                not_in_a_channel := false
+
+        // if price is not in a channel then check if S/R was broken
+        if not_in_a_channel
+            for x = 0 to math.min(9, maxnumsr)
+                if close[1] <= array.get(srLevels, x * 2) and close > array.get(srLevels, x * 2)
+                    resistancebroken := true
+                if close[1] >= array.get(srLevels, x * 2 + 1) and close < array.get(srLevels, x * 2 + 1)
+                    supportbroken := true
+
+        // Confluence: цена внутри зоны или в пределах буфера от неё
+        srNearRes := false
+        srNearSup := false
+        if useSrFilter
+            for x = 0 to math.min(9, maxnumsr)
+                zTop = array.get(srLevels, x * 2)
+                zBot = array.get(srLevels, x * 2 + 1)
+                if zTop != 0
+                    if close <= zTop and close >= zBot // внутри зоны — блокируем оба направления
+                        srNearRes := true
+                        srNearSup := true
+                    if zBot > close and zBot - close <= atr14 * srBuffer // сопротивление прямо над ценой
+                        srNearRes := true
+                    if zTop < close and close - zTop <= atr14 * srBuffer // поддержка прямо под ценой
+                        srNearSup := true
 
 // ═════════════════════════ СИГНАЛЫ И АЛЕРТЫ ═════════════════════════
 confirmOK = not waitForClose or barstate.isconfirmed
