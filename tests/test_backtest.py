@@ -136,6 +136,136 @@ class TestReentryArming(unittest.TestCase):
         self.assertEqual(r["trades"], 1, "после флип-выхода ре-входа быть не должно")
 
 
+class TestEntryQualityFilters(unittest.TestCase):
+    """Новые фильтры должны отсекать слабые входы без будущих данных."""
+
+    @staticmethod
+    def _params(**overrides):
+        params = dict(adxThr=20, tpR=2.0, slmode="zone", zoneW=0.25,
+                      flipExit=True, start=1, tick=0.0)
+        params.update(overrides)
+        return params
+
+    def test_retest_requires_directional_macd_confirmation(self):
+        # На баре 1 есть бычий ретест зоны, но MACD ниже signal. Старая v3.1
+        # входила, потому что ретест проверял только Chandelier, ADX и объём.
+        bars = [(100, 101, 99, 100), (100, 101, 90, 100), (100, 101, 99, 100)]
+        D = make_D(bars, pc=90.0, atr=1.0, re_high=NO_BREAKOUT)
+        D["macd"] = [-1.0] * len(bars)
+        D["sig"] = [0.0] * len(bars)
+
+        legacy = bt.run(D, **self._params(min_di_spread=0.0,
+                                          require_retest_macd=False))
+        filtered = bt.run(D, **self._params(min_di_spread=0.0,
+                                            require_retest_macd=True))
+
+        self.assertEqual(legacy["trades"], 1, "оригинальный ретест должен воспроизводиться")
+        self.assertIsNone(filtered, "ретест против MACD должен быть заблокирован")
+
+    def test_minimum_di_spread_blocks_weak_continuation_entry(self):
+        # Первый сильный сигнал должен сохраниться. После его TP появляется ретест,
+        # где DI+ всё ещё выше DI-, но преимущество всего 2 пункта: это слабое
+        # продолжение, которое новый фильтр должен убрать.
+        bars = [(100, 101, 99, 100), (100, 101, 99, 100),
+                (100, 112, 99, 100), (100, 101, 90, 100),
+                (100, 101, 99, 100)]
+        D = make_D(bars, pc=90.0, atr=1.0, re_high=NO_BREAKOUT)
+        D["dip"] = [30.0, 30.0, 30.0, 12.0, 12.0]
+        D["dim"] = [10.0] * len(bars)
+
+        legacy = bt.run(D, **self._params(tpR=1.0, min_di_spread=0.0,
+                                          require_retest_macd=False))
+        filtered = bt.run(D, **self._params(tpR=1.0, min_di_spread=5.0,
+                                            require_retest_macd=False))
+
+        self.assertEqual(legacy["trades"], 2)
+        self.assertEqual(filtered["trades"], 1,
+                         "продолжение с |DI+ - DI-| < 5 должно быть заблокировано")
+
+    def test_retest_cooldown_can_block_a_nearby_repeat(self):
+        bars = [(100, 101, 99, 100) for _ in range(12)]
+        bars[1] = (100, 101, 90, 100)   # первый ретест
+        bars[2] = (100, 112, 99, 111)   # TP первой сделки
+        bars[8] = (100, 101, 90, 100)   # повтор через 7 баров
+        bars[9] = (100, 112, 99, 111)   # TP второй сделки
+        D = make_D(bars, pc=90.0, atr=1.0, re_high=NO_BREAKOUT)
+        D["macd"] = [-1.0] * len(bars)
+        D["sig"] = [0.0] * len(bars)
+
+        cooldown_5 = bt.run(D, **self._params(
+            tpR=1.0, min_di_spread=0.0, require_retest_macd=False,
+            retest_cooldown=5))
+        cooldown_10 = bt.run(D, **self._params(
+            tpR=1.0, min_di_spread=0.0, require_retest_macd=False,
+            retest_cooldown=10))
+
+        self.assertEqual(cooldown_5["trades"], 2)
+        self.assertEqual(cooldown_10["trades"], 1)
+
+    def test_filter_thresholds_reject_negative_values(self):
+        bars = [(100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 99, 100)]
+        D = make_D(bars)
+
+        with self.assertRaises(ValueError):
+            bt.run(D, **self._params(min_di_spread=-1.0))
+        with self.assertRaises(ValueError):
+            bt.run(D, **self._params(retest_cooldown=-1))
+
+    def test_directional_metrics_are_reported_separately(self):
+        r = run_long(BARS_TP, min_di_spread=5.0, require_retest_macd=True)
+
+        self.assertEqual(r["longTrades"], 1)
+        self.assertEqual(r["longWins"], 1)
+        self.assertEqual(r["longWR"], 100.0)
+        self.assertTrue(r["longPf"] > 1.0)
+        self.assertLessEqual(r["longDdMtM"], 0.0)
+        self.assertEqual(r["shortTrades"], 0)
+        self.assertEqual(r["shortWins"], 0)
+        self.assertEqual(r["shortWR"], 0.0)
+        self.assertEqual(r["shortDdMtM"], 0.0)
+
+
+class TestPineFilterParity(unittest.TestCase):
+    """Индикатор, Pine-стратегия и Python должны использовать один фильтр."""
+
+    @staticmethod
+    def _source(name):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, name)) as f:
+            return f.read()
+
+    def test_indicator_contains_di_and_retest_macd_filters(self):
+        src = self._source("MoneyForesight_v3.pine")
+
+        self.assertIn("minDiSpread", src)
+        self.assertIn("retestNeedsMacd", src)
+        self.assertIn("diSpreadOK = math.abs(diplus - diminus) >= minDiSpread", src)
+        self.assertNotRegex(src, r"longcheck\s*=.*diSpreadOK")
+        self.assertNotRegex(src, r"shortcheck\s*=.*diSpreadOK")
+        self.assertRegex(src, r"retestLongRaw\s*=.*macdLine > signalLine.*diSpreadOK")
+        self.assertRegex(src, r"retestShortRaw\s*=.*signalLine > macdLine.*diSpreadOK")
+        self.assertRegex(src, r"reentryLongRaw\s*=.*diSpreadOK")
+        self.assertRegex(src, r"reentryShortRaw\s*=.*diSpreadOK")
+        # lookahead_on безопасен только вместе со сдвигом на закрытые HTF-бары
+        self.assertIn("lookahead = barmerge.lookahead_on", src)
+        self.assertIn("high[x + 1]", src)
+        self.assertIn("low[x + 1]", src)
+        self.assertNotRegex(src, r"matrix\.set\(hlm, x, \d, (high|low)\[x\]\)")
+
+    def test_strategy_contains_di_and_retest_macd_filters(self):
+        src = self._source("MoneyForesight_strategy.pine")
+
+        self.assertIn("minDiSpread", src)
+        self.assertIn("retestNeedsMacd", src)
+        self.assertIn("diSpreadOK = math.abs(diplus - diminus) >= minDiSpread", src)
+        self.assertNotRegex(src, r"longcheck\s*=.*diSpreadOK")
+        self.assertNotRegex(src, r"shortcheck\s*=.*diSpreadOK")
+        self.assertRegex(src, r"retestLongRaw\s*=.*macdLine > signalLine.*diSpreadOK")
+        self.assertRegex(src, r"retestShortRaw\s*=.*signalLine > macdLine.*diSpreadOK")
+        self.assertRegex(src, r"reentryLongRaw\s*=.*diSpreadOK")
+        self.assertRegex(src, r"reentryShortRaw\s*=.*diSpreadOK")
+
+
 class TestDrawdown(unittest.TestCase):
     """Находка №6: просадка только по закрытым сделкам прячет нереализованный минус."""
 

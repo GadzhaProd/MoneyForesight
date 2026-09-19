@@ -56,6 +56,13 @@
 //   • строки статистики подписаны реальным предикатом фильтра, а не сравнением с порогом
 //   • «ход после отбоя» не засчитывает бар, на котором цена вернулась в зону
 //
+// Изменения v3.2 — фильтр качества продолжений (сентябрь 2026):
+//   • ретест-входы требуют MACD в сторону сделки (Retest Must Follow MACD)
+//   • ретесты и ре-входы требуют |DI+ − DI−| ≥ Minimum DI Spread (по умолчанию 5);
+//     первичный flip-сигнал не фильтруется
+//   • S/R старшего ТФ строится только по закрытым HTF-свечам (high/low[x + 1]
+//     + lookahead_on) — развивающаяся свеча больше не перерисовывает зоны
+//
 // Осознанно оставлено как в оригинале:
 //   • зоны S/R считаются только на последнем баре — исторических зон нет,
 //     бэктест по ним невозможен (архитектура исходного скрипта)
@@ -63,7 +70,7 @@
 //   • цикл силы зон смотрит фиксированные 500 баров: на короткой истории
 //     na-бары безвредно игнорируются
 //@version=5
-indicator('MoneyForesight v3.1', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+indicator('MoneyForesight v3.2', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
 
 // ═════════════════════════ НАСТРОЙКИ (сгруппированы по важности) ═════════════════════════
 gMain = '★ 1 · Сделка: тейк / стоп / входы'
@@ -82,6 +89,8 @@ waitForClose = input.bool(true, 'Signals on Bar Close Only', tooltip = 'Сигн
 useAdxFilter = input.bool(true, 'Filter by ADX (Trend Strength)', tooltip = 'Сигналы и ретесты только когда ADX выше порога — отсекает боковик.', group = gFilt)
 adxThreshold = input.float(20, 'ADX Threshold', minval = 5, maxval = 50, step = 1, group = gFilt)
 useAdxRising = input.bool(true, 'ADX Rising Counts as Trend', tooltip = 'Пропускать сигнал, когда ADX ещё ниже порога, но не ниже его половины и растёт 3 бара подряд — ловит молодой тренд (ADX запаздывает).', group = gFilt)
+minDiSpread  = input.float(5.0, 'Minimum DI Spread (continuations)', minval = 0.0, step = 1.0, tooltip = 'Минимальное преимущество ведущего DI для ретестов и ре-входов. Первый flip-сигнал не режется: 5 убирает слабые продолжения тренда. 0 вместе с выключенным «Retest Must Follow MACD» возвращает поведение v3.1.', group = gFilt)
+retestNeedsMacd = input.bool(true, 'Retest Must Follow MACD', tooltip = 'LONG-ретест только при MACD выше signal, SHORT-ретест — при MACD ниже signal. Убирает откаты, которые уже идут против текущего импульса.', group = gFilt)
 useVolFilter = input.bool(true, 'Confirm Signals by Volume', tooltip = 'Вход только на баре с объёмом выше средней × порог. На инструментах без данных объёма пропускает все бары.', group = gFilt)
 volLen       = input.int(20, 'Volume SMA Length', minval = 1, group = gFilt)
 volMult      = input.float(1.2, 'Volume Threshold (× SMA)', minval = 0.1, step = 0.1, tooltip = '1.0 = выше среднего; 1.2 = на 20% выше; 1.5–2.0 = только явные всплески.', group = gFilt)
@@ -216,6 +225,7 @@ volOK  = na(volume) or na(volSMA) or volume > volSMA * volMult
 
 // сила тренда: ниже порога — боковик; растущий ADX выше половины порога тоже считается трендом
 adxOK = adxValue >= adxThreshold or (useAdxRising and adxValue >= adxThreshold * 0.5 and ta.rising(adxValue, 3))
+diSpreadOK = math.abs(diplus - diminus) >= minDiSpread
 
 longcheck  = diplus > diminus and macdLine > signalLine and (not useCsFilter or csDir > 0) and (not useRbFilter or rbHeat > 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
 shortcheck = diminus > diplus and signalLine > macdLine and (not useCsFilter or csDir < 0) and (not useRbFilter or rbHeat < 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
@@ -239,9 +249,14 @@ get_highlow() =>
     var hlm = matrix.new<float>(loopback, 2, 0.)
     if barstate.islast // use less memory
         for x = 0 to loopback - 1
-            matrix.set(hlm, x, 0, high[x])
-            matrix.set(hlm, x, 1, low[x])
+            // Только полностью закрытые HTF-бары: текущий HTF-бар ещё меняется
+            // и иначе мог бы перерисовать S/R на младшем таймфрейме.
+            matrix.set(hlm, x, 0, high[x + 1])
+            matrix.set(hlm, x, 1, low[x + 1])
     hlm
+// [x + 1] + lookahead_on — штатная схема без перерисовки. С lookahead_off последний
+// исторический бар графика (рынок закрыт, HTF-свеча не закрыта) получил бы матрицу
+// предыдущего HTF-бара, а она заполняется только на barstate.islast — одни нули, S/R пропадают.
 hlmatrix = request.security(syminfo.tickerid, srTF, get_highlow(), lookahead = barmerge.lookahead_on)
 
 if na(hlmatrix)
@@ -495,8 +510,8 @@ shortSignalB = shortSignal and not shortRiskOK
 // showRetest сюда НЕ входит: это тумблер отрисовки, а не расчёта — иначе он
 // заодно выключал бы ретест-алерты и виртуальные входы при включённом «Enter on Retests Too»
 retestFiltersOK = (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
-retestLongRaw  = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and retestFiltersOK and confirmOK
-retestShortRaw = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and retestFiltersOK and confirmOK
+retestLongRaw  = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and (not retestNeedsMacd or macdLine > signalLine) and diSpreadOK and retestFiltersOK and confirmOK
+retestShortRaw = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and (not retestNeedsMacd or signalLine > macdLine) and diSpreadOK and retestFiltersOK and confirmOK
 
 var int lastRetestLong  = -99999
 var int lastRetestShort = -99999
@@ -618,8 +633,8 @@ var bool reArmShort = false
 
 reBaseHigh = ta.highest(high, reentryLkb)[1]
 reBaseLow  = ta.lowest(low, reentryLkb)[1]
-reentryLongRaw  = useReentry and reArmLong and longcheck and csDir > 0 and close > reBaseHigh and confirmOK
-reentryShortRaw = useReentry and reArmShort and shortcheck and csDir < 0 and close < reBaseLow and confirmOK
+reentryLongRaw  = useReentry and reArmLong and longcheck and csDir > 0 and close > reBaseHigh and diSpreadOK and confirmOK
+reentryShortRaw = useReentry and reArmShort and shortcheck and csDir < 0 and close < reBaseLow and diSpreadOK and confirmOK
 reentryLongSig  = false
 reentryShortSig = false
 
