@@ -5,6 +5,7 @@ MoneyForesight Strategy - независимый бэктест на чисто�
 Точная копия логики MoneyForesight_strategy.pine:
   Chandelier(22,22,3) + зона, DMI(14,10)+MACD(12,26,9), Rainbow beta-MA(50)+RSI heat,
   Volume SMA(20)x1.2, ADX-порог с опцией "растущий ADX", ретесты зоны (кулдаун 5),
+  минимальный разрыв DI и подтверждение направления ретеста по MACD,
   ре-вход по пробою 5 баров ПОСЛЕ ВЫБИТОГО СТОПА, TP = R x риск,
   SL = край зоны / линия / база пробоя, флип-выход,
   комиссия 0.05% за сторону + проскальзывание 1 тик (как slippage в Pine).
@@ -32,10 +33,15 @@ FEE = 0.0005              # 0.05% за сторону
 CACHE_SCHEMA = 1          # версия формата кэша; старые голые списки считаются протухшими
 SLIPPAGE_TICKS = 1        # как slippage = 1 в MoneyForesight_strategy.pine
 WARMUP = 150              # баров на прогрев индикаторов до первой возможной сделки
+MIN_DI_SPREAD = 5.0       # минимум DI для ретестов/ре-входов по анализу v3.1
+REQUIRE_RETEST_MACD = True  # ретест только при MACD в сторону сделки
 
 # явная схема CSV: файл создаётся даже когда ни одна конфигурация не дала сделок
-FIELDS = ["tf", "adx", "tpR", "sl", "flip", "period", "net", "pf", "trades", "wins",
-          "dd", "ddMtM", "longR", "shortR", "tp", "slc", "fl", "eod"]
+FIELDS = ["tf", "adx", "tpR", "sl", "flip", "minDi", "rtMacd", "rtCd", "period",
+          "net", "pf", "trades", "wins", "dd", "ddMtM",
+          "longR", "longPf", "longTrades", "longWins", "longWR", "longDd", "longDdMtM",
+          "shortR", "shortPf", "shortTrades", "shortWins", "shortWR", "shortDd", "shortDdMtM",
+          "tp", "slc", "fl", "eod"]
 
 _INTERVAL_UNIT_MS = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
 
@@ -298,7 +304,14 @@ def prepare(kl):
 
 
 def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
-        start=WARMUP, tick=0.0, slippage_ticks=SLIPPAGE_TICKS):
+        start=WARMUP, tick=0.0, slippage_ticks=SLIPPAGE_TICKS,
+        min_di_spread=MIN_DI_SPREAD, require_retest_macd=REQUIRE_RETEST_MACD,
+        retest_cooldown=5):
+    if min_di_spread < 0:
+        raise ValueError("min_di_spread должен быть >= 0")
+    if retest_cooldown < 0:
+        raise ValueError("retest_cooldown должен быть >= 0")
+
     n = D["n"]; o, c, h, l = D["o"], D["c"], D["h"], D["l"]
     csDir, pc, atr = D["csDir"], D["pc"], D["atr22"]
     slip = tick * slippage_ticks
@@ -310,6 +323,11 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
     reArmLong = reArmShort = False
     equityR = 0.0; peakClosed = 0.0; ddClosed = 0.0
     peakMark = 0.0; ddMtM = 0.0
+    sideEquity = {1: 0.0, -1: 0.0}
+    sidePeakClosed = {1: 0.0, -1: 0.0}
+    sideDdClosed = {1: 0.0, -1: 0.0}
+    sidePeakMark = {1: 0.0, -1: 0.0}
+    sideDdMtM = {1: 0.0, -1: 0.0}
 
     def close_trade(d, fill, prisk, exit_price, outcome):
         """Считает результат в R. Знаменатель — ПЛАНОВЫЙ риск (close - sl), как
@@ -322,7 +340,8 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
         return gross - feeR
 
     for i in range(start, n):
-        if None in (pc[i], atr[i], D["adx"][i], D["macd"][i], D["sig"][i], D["volSMA"][i]):
+        if None in (pc[i], atr[i], D["dip"][i], D["dim"][i], D["adx"][i],
+                    D["macd"][i], D["sig"][i], D["volSMA"][i]):
             continue
         zT = pc[i] + zoneW * atr[i]; zB = pc[i] - zoneW * atr[i]
         zTp = pc[i - 1] + zoneW * atr[i - 1] if atr[i - 1] and pc[i - 1] else None
@@ -330,6 +349,7 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
         volOK = D["v"][i] > D["volSMA"][i] * volMult
         adxOK = D["adx"][i] >= adxThr or (useRising and D["adx"][i] >= adxThr * 0.5 and D["risingADX"][i])
         fOK = volOK and adxOK
+        diSpreadOK = abs(D["dip"][i] - D["dim"][i]) >= min_di_spread
         lc = (D["dip"][i] > D["dim"][i] and D["macd"][i] > D["sig"][i] and csDir[i] > 0
               and D["heat"][i] > 0.5 and fOK)
         sc = (D["dim"][i] > D["dip"][i] and D["sig"][i] > D["macd"][i] and csDir[i] < 0
@@ -358,9 +378,13 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
                     elif l[i] <= tp: exitP, out = tp, "TP"
                     elif flipExit and csDir[i] > 0: exitP, out = c[i], "FLIP"
                 if exitP is not None:
-                    equityR += close_trade(d, fill, prisk, exitP, out)
+                    tradeR = close_trade(d, fill, prisk, exitP, out)
+                    equityR += tradeR
                     peakClosed = max(peakClosed, equityR)
                     ddClosed = min(ddClosed, equityR - peakClosed)
+                    sideEquity[d] += tradeR
+                    sidePeakClosed[d] = max(sidePeakClosed[d], sideEquity[d])
+                    sideDdClosed[d] = min(sideDdClosed[d], sideEquity[d] - sidePeakClosed[d])
                     if out == "SL":
                         if d == 1: reArmLong = True
                         else: reArmShort = True
@@ -369,15 +393,21 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
         # входы
         if pos is None:
             rtL = (csDir[i] > 0 and csDir[i - 1] > 0 and zTp is not None and c[i] > zT
-                   and (l[i] <= zT or c[i - 1] <= zTp) and fOK and i - lastRtL > 5)
+                   and (l[i] <= zT or c[i - 1] <= zTp) and fOK and diSpreadOK
+                   and (not require_retest_macd or D["macd"][i] > D["sig"][i])
+                   and i - lastRtL > retest_cooldown)
             if rtL: lastRtL = i
             rtS = (csDir[i] < 0 and csDir[i - 1] < 0 and zBp is not None and c[i] < zB
-                   and (h[i] >= zB or c[i - 1] >= zBp) and fOK and i - lastRtS > 5)
+                   and (h[i] >= zB or c[i - 1] >= zBp) and fOK and diSpreadOK
+                   and (not require_retest_macd or D["sig"][i] > D["macd"][i])
+                   and i - lastRtS > retest_cooldown)
             if rtS: lastRtS = i
             reL = (reArmLong and lc and csDir[i] > 0
-                   and D["reHigh"][i - 1] is not None and c[i] > D["reHigh"][i - 1])
+                   and D["reHigh"][i - 1] is not None and c[i] > D["reHigh"][i - 1]
+                   and diSpreadOK)
             reS = (reArmShort and sc and csDir[i] < 0
-                   and D["reLow"][i - 1] is not None and c[i] < D["reLow"][i - 1])
+                   and D["reLow"][i - 1] is not None and c[i] < D["reLow"][i - 1]
+                   and diSpreadOK)
             if longFlip or rtL or reL:
                 isRe = not (longFlip or rtL)
                 sl = D["reLow"][i - 1] if isRe else (zB if slmode == "zone" else pc[i])
@@ -405,16 +435,31 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
             markR += (adverse - fill) / prisk * d - FEE * (fill + adverse) / prisk
         peakMark = max(peakMark, markR)
         ddMtM = min(ddMtM, markR - peakMark)
+        for direction in (1, -1):
+            sideMark = sideEquity[direction]
+            if pos is not None and pos[0] == direction:
+                d, fill, prisk, _, _, eb = pos
+                adverse = c[i] if i == eb else (l[i] if d == 1 else h[i])
+                sideMark += (adverse - fill) / prisk * d - FEE * (fill + adverse) / prisk
+            sidePeakMark[direction] = max(sidePeakMark[direction], sideMark)
+            sideDdMtM[direction] = min(sideDdMtM[direction],
+                                       sideMark - sidePeakMark[direction])
 
     # позиция, дожившая до конца датасета, закрывается по последнему close:
     # иначе она молча выпадала из всех метрик
     if pos is not None:
         d, fill, prisk, _, _, _ = pos
-        equityR += close_trade(d, fill, prisk, c[n - 1], "EOD")
+        tradeR = close_trade(d, fill, prisk, c[n - 1], "EOD")
+        equityR += tradeR
         peakClosed = max(peakClosed, equityR)
         ddClosed = min(ddClosed, equityR - peakClosed)
+        sideEquity[d] += tradeR
+        sidePeakClosed[d] = max(sidePeakClosed[d], sideEquity[d])
+        sideDdClosed[d] = min(sideDdClosed[d], sideEquity[d] - sidePeakClosed[d])
         peakMark = max(peakMark, equityR)
         ddMtM = min(ddMtM, equityR - peakMark)
+        sidePeakMark[d] = max(sidePeakMark[d], sideEquity[d])
+        sideDdMtM[d] = min(sideDdMtM[d], sideEquity[d] - sidePeakMark[d])
 
     # метрики
     if not trades:
@@ -424,10 +469,27 @@ def run(D, adxThr, tpR, slmode, zoneW, flipExit, useRising=True, volMult=1.2,
     gl = -sum(t[1] for t in trades if t[1] < 0)
     pf = gw / gl if gl > 0 else float("inf")
     wins = sum(1 for t in trades if t[1] > 0)
-    longR = sum(t[1] for t in trades if t[0] == 1)
-    shortR = sum(t[1] for t in trades if t[0] == -1)
+
+    def side_metrics(direction):
+        side = [t for t in trades if t[0] == direction]
+        sideNet = sum(t[1] for t in side)
+        sideGrossWin = sum(t[1] for t in side if t[1] > 0)
+        sideGrossLoss = -sum(t[1] for t in side if t[1] < 0)
+        sidePf = sideGrossWin / sideGrossLoss if sideGrossLoss > 0 else (
+            float("inf") if sideGrossWin > 0 else 0.0)
+        sideWins = sum(1 for t in side if t[1] > 0)
+        sideTrades = len(side)
+        sideWr = 100.0 * sideWins / sideTrades if sideTrades else 0.0
+        return sideNet, sidePf, sideTrades, sideWins, sideWr
+
+    longR, longPf, longTrades, longWins, longWR = side_metrics(1)
+    shortR, shortPf, shortTrades, shortWins, shortWR = side_metrics(-1)
     return dict(net=net, pf=pf, trades=len(trades), wins=wins,
                 dd=ddClosed, ddMtM=ddMtM, longR=longR, shortR=shortR,
+                longPf=longPf, longTrades=longTrades, longWins=longWins, longWR=longWR,
+                longDd=sideDdClosed[1], longDdMtM=sideDdMtM[1],
+                shortPf=shortPf, shortTrades=shortTrades, shortWins=shortWins, shortWR=shortWR,
+                shortDd=sideDdClosed[-1], shortDdMtM=sideDdMtM[-1],
                 tp=sum(1 for t in trades if t[2] == "TP"),
                 slc=sum(1 for t in trades if t[2] == "SL"),
                 fl=sum(1 for t in trades if t[2] == "FLIP"),
@@ -462,12 +524,21 @@ def main(argv=None):
     ap.add_argument("--offline", action="store_true", help="использовать снапшот кэша как есть")
     ap.add_argument("--slippage-ticks", type=float, default=SLIPPAGE_TICKS,
                     help="проскальзывание в тиках на сторону (по умолчанию 1, как в Pine)")
+    ap.add_argument("--min-di-spread", type=float, default=MIN_DI_SPREAD,
+                    help="минимум |DI+ - DI-| для ретеста/ре-входа "
+                         "(0 вместе с --allow-retest-macd-mismatch = исходная v3.1)")
+    ap.add_argument("--allow-retest-macd-mismatch", action="store_true",
+                    help="разрешить ретест против MACD (воспроизводит исходную v3.1)")
+    ap.add_argument("--retest-cooldown", type=int, default=5,
+                    help="минимум баров между ретестами одного направления")
     args = ap.parse_args(argv)
     symbol = args.symbol
 
     print(f"########## {symbol} ##########")
     tick = fetch_tick_size(symbol, offline=args.offline)
     print(f"шаг цены {tick}, проскальзывание {args.slippage_ticks} тик(а) на сторону")
+    print(f"фильтр продолжений: |DI+ - DI-| >= {args.min_di_spread}, "
+          f"MACD для ретеста {'не обязателен' if args.allow_retest_macd_mismatch else 'обязателен'}")
     tfs = [("5m", 50000), ("15m", 35000), ("30m", 35000), ("1h", 17500), ("4h", 8000)]
     grid_adx = [18, 23, 28]
     grid_tp = [1.5, 2.0, 3.0]
@@ -486,10 +557,16 @@ def main(argv=None):
                 for slm, zw in grid_sl:
                     for fe in grid_flip:
                         r = run(D, adxT, tpR, slm, zw, fe, tick=tick,
-                                slippage_ticks=args.slippage_ticks)
+                                slippage_ticks=args.slippage_ticks,
+                                min_di_spread=args.min_di_spread,
+                                require_retest_macd=not args.allow_retest_macd_mismatch,
+                                retest_cooldown=args.retest_cooldown)
                         if r:
                             r.update(tf=tf, adx=adxT, tpR=tpR,
                                      sl=f"{slm}{zw if slm=='zone' else ''}", flip=fe,
+                                     minDi=args.min_di_spread,
+                                     rtMacd=not args.allow_retest_macd_mismatch,
+                                     rtCd=args.retest_cooldown,
                                      period=f"{d0}..{d1}")
                             results.append(r)
         print(f"   готово, конфигураций: {len([x for x in results if x['tf']==tf])}", flush=True)

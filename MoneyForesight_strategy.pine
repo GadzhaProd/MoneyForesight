@@ -17,8 +17,12 @@
 //   • размер позиции учитывает syminfo.pointvalue — риск на сделку теперь
 //     действительно равен заявленному проценту и на инструментах с pointvalue != 1
 //   • Rainbow: длина от 3 + фолбэк на SMA при вырожденных весах
+// Изменения 1.2 — фильтр качества продолжений (сентябрь 2026), как в индикаторе v3.2:
+//   • ретест-входы требуют MACD в сторону сделки (Retest Must Follow MACD)
+//   • ретесты и ре-входы требуют |DI+ − DI−| ≥ Minimum DI Spread (по умолчанию 5);
+//     первичный flip-сигнал не фильтруется
 //@version=5
-strategy('MoneyForesight Strategy 1.1', overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, max_boxes_count = 100, max_labels_count = 500)
+strategy('MoneyForesight Strategy 1.2', overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, max_boxes_count = 100, max_labels_count = 500)
 
 // ═════════════════════════ НАСТРОЙКИ ═════════════════════════
 // Порядок групп = порядок важности. Ищем стратегию ТОЛЬКО ручками из группы «ГЛАВНОЕ»,
@@ -42,6 +46,8 @@ retestCooldown = input.int(5, 'Retest Cooldown (bars)', minval = 0, tooltip = '�
 gFilt = '3 · Фильтры (обычно не трогать)'
 useAdxFilter = input.bool(true, 'Filter by ADX', tooltip = 'Главный фильтр боковика — держите включённым. Сам порог настраивается в группе ГЛАВНОЕ.', group = gFilt)
 useAdxRising = input.bool(true, 'ADX Rising Counts as Trend', tooltip = 'ADX выше половины порога и растущий 3 бара подряд тоже считается трендом — ловит молодой тренд (сам ADX запаздывает).', group = gFilt)
+minDiSpread  = input.float(5.0, 'Minimum DI Spread (continuations)', minval = 0.0, step = 1.0, tooltip = 'Минимальное преимущество ведущего DI для ретестов и ре-входов. Первый flip-сигнал не режется: 5 убирает слабые продолжения тренда. 0 вместе с выключенным «Retest Must Follow MACD» возвращает поведение Strategy 1.1.', group = gFilt)
+retestNeedsMacd = input.bool(true, 'Retest Must Follow MACD', tooltip = 'LONG-ретест только при MACD выше signal, SHORT-ретест — при MACD ниже signal.', group = gFilt)
 useVolFilter = input.bool(true, 'Confirm Signals by Volume', tooltip = 'Вход только на баре с объёмом выше средней × порог — отсекает развороты «без денег».', group = gFilt)
 volLen       = input.int(20, 'Volume SMA Length', minval = 1, group = gFilt)
 volMult      = input.float(1.2, 'Volume Threshold (× SMA)', minval = 0.1, step = 0.1, tooltip = '1.2 = объём минимум на 20% выше среднего. На младших ТФ можно попробовать 1.5.', group = gFilt)
@@ -113,6 +119,7 @@ rbHeat = nz(ta.rsi(filt, rbLength), 50) / 100
 volSMA = ta.sma(volume, volLen)
 volOK  = na(volume) or na(volSMA) or volume > volSMA * volMult
 adxOK  = adxValue >= adxThreshold or (useAdxRising and adxValue >= adxThreshold * 0.5 and ta.rising(adxValue, 3))
+diSpreadOK = math.abs(diplus - diminus) >= minDiSpread
 
 longcheck  = diplus > diminus and macdLine > signalLine and (not useCsFilter or csDir > 0) and (not useRbFilter or rbHeat > 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
 shortcheck = diminus > diplus and signalLine > macdLine and (not useCsFilter or csDir < 0) and (not useRbFilter or rbHeat < 0.5) and (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
@@ -124,8 +131,8 @@ shortFlip = trade == -1 and trade[1] != -1
 
 // ретесты зоны-магнита
 retestFiltersOK = (not useVolFilter or volOK) and (not useAdxFilter or adxOK)
-retestLongRaw   = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and retestFiltersOK
-retestShortRaw  = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and retestFiltersOK
+retestLongRaw   = csDir > 0 and csDir[1] > 0 and close > zoneTop and (low <= zoneTop or close[1] <= zoneTop[1]) and (not retestNeedsMacd or macdLine > signalLine) and diSpreadOK and retestFiltersOK
+retestShortRaw  = csDir < 0 and csDir[1] < 0 and close < zoneBot and (high >= zoneBot or close[1] >= zoneBot[1]) and (not retestNeedsMacd or signalLine > macdLine) and diSpreadOK and retestFiltersOK
 
 var int lastRetestLong  = -99999
 var int lastRetestShort = -99999
@@ -145,8 +152,8 @@ var bool flipRequested = false
 
 reBaseHigh = ta.highest(high, reentryLkb)[1]
 reBaseLow  = ta.lowest(low, reentryLkb)[1]
-reentryLongRaw  = useReentry and reArmLong and longcheck and csDir > 0 and close > reBaseHigh
-reentryShortRaw = useReentry and reArmShort and shortcheck and csDir < 0 and close < reBaseLow
+reentryLongRaw  = useReentry and reArmLong and longcheck and csDir > 0 and close > reBaseHigh and diSpreadOK
+reentryShortRaw = useReentry and reArmShort and shortcheck and csDir < 0 and close < reBaseLow and diSpreadOK
 
 // ═════════════════════════ ИСПОЛНЕНИЕ ═════════════════════════
 flat = strategy.position_size == 0
