@@ -62,6 +62,43 @@ def run_long(bars, **kw):
     return bt.run(D, **params)
 
 
+def klines_from_closes(closes):
+    """Часовые свечи: open = прошлый close, тени по 0.5 от тела."""
+    out, prev = [], closes[0]
+    for i, c in enumerate(closes):
+        o = prev
+        out.append(kline(i * 3_600_000, o, max(o, c) + 0.5, min(o, c) - 0.5, c,
+                         close_time=i * 3_600_000 + 3_599_999))
+        prev = c
+    return out
+
+
+FLAT = [100 + (0.3 if i % 2 else -0.3) for i in range(60)]   # флэт, ATR ~1
+
+
+class TestChandelierFlip(unittest.TestCase):
+    """Разворот линии: закрытие выше обеих линий прошлой свечи (вниз — ниже обеих)."""
+
+    def test_dip_after_vertical_impulse_does_not_stick_in_short(self):
+        # После импульса 100 -> 130 22-свечной диапазон шире 6 ATR: линия лонга
+        # (максимум - 3 ATR) выше линии шорта (минимум + 3 ATR). Пролив до 121 пробивает
+        # линию лонга, но остаётся над линией шорта. Раньше состояние переключалось в шорт
+        # с линией ~108 ПОД ценой и застревало так, пока цена росла до 137.
+        closes = FLAT + [104, 112, 122, 130, 121, 123, 125, 127, 129, 131, 133, 135, 137]
+        D = bt.prepare(klines_from_closes(closes))
+        dip = len(FLAT) + 4
+        self.assertTrue(all(d == 1 for d in D["csDir"][dip:]),
+                        "пролив внутри диапазона не должен переворачивать тренд в шорт")
+        self.assertTrue(all(D["pc"][i] < D["c"][i] for i in range(dip + 1, D["n"])),
+                        "в продолжении роста линия лонга должна стоять под ценой")
+
+    def test_clear_downtrend_still_flips_to_short(self):
+        closes = FLAT + [100 - 1.5 * k for k in range(1, 21)]
+        D = bt.prepare(klines_from_closes(closes))
+        self.assertEqual(D["csDir"][-1], -1)
+        self.assertGreater(D["pc"][-1], D["c"][-1], "линия шорта должна быть над ценой")
+
+
 class TestAdxParity(unittest.TestCase):
     """Находка №3: ta.rising сравнивает с максимумом, а не требует монотонности."""
 
@@ -264,6 +301,17 @@ class TestPineFilterParity(unittest.TestCase):
         self.assertRegex(src, r"retestShortRaw\s*=.*signalLine > macdLine.*diSpreadOK")
         self.assertRegex(src, r"reentryLongRaw\s*=.*diSpreadOK")
         self.assertRegex(src, r"reentryShortRaw\s*=.*diSpreadOK")
+
+    def test_all_scripts_flip_on_both_lines_and_grey_out_off_side_line(self):
+        for name in ("MoneyForesight_v3.pine", "MoneyForesight_strategy.pine",
+                     "MoneyForesight_v2.pine"):
+            src = self._source(name)
+            with self.subTest(script=name):
+                self.assertIn("longswitch  = close >= shortvs[1] and close > longvs[1]", src)
+                self.assertIn("shortswitch = close <= longvs[1] and close < shortvs[1]", src)
+                self.assertNotIn("close[1] < shortvs[1]", src, "разворот не должен требовать пересечения")
+                self.assertIn("csOnSide = csDir > 0 ? close >= pc : close <= pc", src)
+                self.assertIn("not csOnSide ? color.gray", src)
 
 
 class TestDrawdown(unittest.TestCase):

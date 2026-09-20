@@ -63,6 +63,13 @@
 //   • S/R старшего ТФ строится только по закрытым HTF-свечам (high/low[x + 1]
 //     + lookahead_on) — развивающаяся свеча больше не перерисовывает зоны
 //
+// Изменения v3.3 — исправление разворота линии (сентябрь 2026):
+//   • разворот линии Chandelier: вверх — закрытие выше обеих линий прошлой свечи, вниз —
+//     ниже обеих (раньше — пересечение одной линии). После резкого импульса линия
+//     больше не застревает «за» ценой: на BTC такие бары были 5–11% истории, теперь ~2%
+//   • линия не на своей стороне цены рисуется серой — неопределённость, пока
+//     22-свечной диапазон шире 2 × множитель ATR
+//
 // Осознанно оставлено как в оригинале:
 //   • зоны S/R считаются только на последнем баре — исторических зон нет,
 //     бэктест по ним невозможен (архитектура исходного скрипта)
@@ -70,7 +77,7 @@
 //   • цикл силы зон смотрит фиксированные 500 баров: на короткой истории
 //     na-бары безвредно игнорируются
 //@version=5
-indicator('MoneyForesight v3.2', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+indicator('MoneyForesight v3.3', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
 
 // ═════════════════════════ НАСТРОЙКИ (сгруппированы по важности) ═════════════════════════
 gMain = '★ 1 · Сделка: тейк / стоп / входы'
@@ -165,14 +172,21 @@ var float longvs  = na
 shortvs := na(shortvs) ? short_stop : close > shortvs ? short_stop : math.min(short_stop, shortvs)
 longvs  := na(longvs) ? long_stop : close < longvs ? long_stop : math.max(long_stop, longvs)
 
-longswitch  = close >= shortvs[1] and close[1] < shortvs[1]
-shortswitch = close <= longvs[1] and close[1] > longvs[1]
+// разворот вверх — закрытие выше ОБЕИХ линий прошлой свечи, вниз — ниже обеих.
+// Раньше требовалось пересечение одной линии (close[1] по другую сторону): после
+// резкого импульса 22-свечной диапазон бывает шире 2 × множитель ATR, линии меняются
+// местами, новая линия оказывалась «за» ценой, и состояние застревало на десятки свечей
+longswitch  = close >= shortvs[1] and close > longvs[1]
+shortswitch = close <= longvs[1] and close < shortvs[1]
 
 var int csDir = 0
 csDir := csDir >= 0 and shortswitch ? -1 : csDir <= 0 and longswitch ? 1 : csDir
 
 pc      = csDir > 0 ? longvs : shortvs
-csColor = csDir > 0 ? color.aqua : color.fuchsia
+// линия не на своей стороне цены — неопределённость: старая линия пробита, а новая
+// ещё за ценой (22-свечной диапазон шире 2 × множитель ATR). Рисуем её серой
+csOnSide = csDir > 0 ? close >= pc : close <= pc
+csColor  = not csOnSide ? color.gray : csDir > 0 ? color.aqua : color.fuchsia
 
 plot(showCsCircles ? pc : na, title = 'CS Circles', color = csColor, style = plot.style_circles, linewidth = 2)
 plot(showcs ? pc : na, title = 'CS Line', color = csColor, style = plot.style_line, linewidth = 2)

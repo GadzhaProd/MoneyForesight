@@ -251,8 +251,10 @@ def prepare(kl):
         longvs[i]  = ls if pL is None else (ls if c[i] < pL else max(ls, pL))
         d = csDir[i - 1] if i else 0
         if i and shortvs[i - 1] is not None and longvs[i - 1] is not None:
-            longswitch  = c[i] >= shortvs[i - 1] and c[i - 1] < shortvs[i - 1]
-            shortswitch = c[i] <= longvs[i - 1] and c[i - 1] > longvs[i - 1]
+            # разворот вверх — закрытие выше обеих линий прошлой свечи, вниз — ниже обеих
+            # (без требования пересечения — иначе после импульса состояние застревало)
+            longswitch  = c[i] >= shortvs[i - 1] and c[i] > longvs[i - 1]
+            shortswitch = c[i] <= longvs[i - 1] and c[i] < shortvs[i - 1]
             if d >= 0 and shortswitch: d = -1
             elif d <= 0 and longswitch: d = 1
         csDir[i] = d
