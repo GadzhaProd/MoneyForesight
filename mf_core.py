@@ -254,3 +254,112 @@ def rainbow_state(D, i, fresh_bars=3, delta_bars=3):
         heat_side=heat_side, heat_cross_bars=heat_bars,
         heat_fresh=heat_bars is not None and heat_bars < fresh_bars,
     )
+
+
+# ---------- сигналы индикатора для пульта ----------
+# Порт блока «СИГНАЛЫ И АЛЕРТЫ» из MoneyForesight_v3.pine. Значения по умолчанию — как у
+# ИНДИКАТОРА (ADX 20), а не у стратегии (ADX 18). Не портированы: S/R-фильтр (работает только
+# на живом баре), ре-вход (требует симуляции виртуальной сделки и выбитого стопа) и грейд A/B.
+SIGNAL_DEFAULTS = dict(adx_thr=20.0, use_rising=True, vol_mult=1.2, min_di_spread=5.0,
+                       retest_macd=True, retest_cooldown=5, zone_w=0.25)
+
+
+def signal_series(D, **params):
+    """Сигналы индикатора на каждом баре (по закрытию).
+
+    trade   — состояние BUY/SELL: +1 лонг, -1 шорт, 0 — сигнала ещё не было; меняется только
+              когда выполнены все условия новой стороны, иначе сохраняется;
+    flip    — +1 / -1 на баре, где состояние сменилось (метка BUY / SELL), иначе 0;
+    retest  — +1 / -1 на баре ретеста зоны-магнита, иначе 0. Кулдаун считается от прошлого
+              ретеста в ту же сторону независимо от позиции — как в индикаторе, но не как в
+              backtest.run(), где он обновляется только пока позиции нет;
+    adx_ok  — тренд по ADX (порог или растущий ADX выше половины порога)."""
+    unknown = set(params) - set(SIGNAL_DEFAULTS)
+    if unknown:
+        raise TypeError(f"неизвестные параметры сигналов: {sorted(unknown)}")
+    p = {**SIGNAL_DEFAULTS, **params}
+    if p["min_di_spread"] < 0 or p["retest_cooldown"] < 0:
+        raise ValueError("min_di_spread и retest_cooldown должны быть >= 0")
+
+    n = D["n"]
+    c, h, l, v = D["c"], D["h"], D["l"], D["v"]
+    cs, pc, atr = D["csDir"], D["pc"], D["atr22"]
+    zw = p["zone_w"]
+    trade, flip, retest, adx_ok_s = [0] * n, [0] * n, [0] * n, [False] * n
+    state = 0
+    last_rt = {1: -99999, -1: -99999}
+
+    for i in range(n):
+        dip, dim, adx, macd, sig = D["dip"][i], D["dim"][i], D["adx"][i], D["macd"][i], D["sig"][i]
+        have = None not in (dip, dim, adx, macd, sig)     # в Pine сравнения с na дают false
+        vol_sma = D["volSMA"][i]
+        vol_ok = vol_sma is None or v[i] > vol_sma * p["vol_mult"]
+        thr = p["adx_thr"]
+        adx_ok = have and (adx >= thr or (p["use_rising"] and adx >= thr * 0.5 and D["risingADX"][i]))
+        adx_ok_s[i] = bool(adx_ok)
+        filters_ok = vol_ok and adx_ok
+
+        lc = have and dip > dim and macd > sig and cs[i] > 0 and D["heat"][i] > 0.5 and filters_ok
+        sc = have and dim > dip and sig > macd and cs[i] < 0 and D["heat"][i] < 0.5 and filters_ok
+        prev = state
+        state = 1 if lc else -1 if sc else state
+        trade[i] = state
+        if state != prev:
+            flip[i] = state
+
+        if i == 0 or not filters_ok or pc[i] is None or atr[i] is None:
+            continue
+        if abs(dip - dim) < p["min_di_spread"]:
+            continue
+        zt, zb = pc[i] + zw * atr[i], pc[i] - zw * atr[i]
+        prev_ok = pc[i - 1] is not None and atr[i - 1] is not None
+        zt_p = pc[i - 1] + zw * atr[i - 1] if prev_ok else None
+        zb_p = pc[i - 1] - zw * atr[i - 1] if prev_ok else None
+        # откат в зону: тень достала край зоны либо прошлая свеча закрылась внутри неё,
+        # и текущая закрылась обратно за внешним краем
+        rl = (cs[i] > 0 and cs[i - 1] > 0 and c[i] > zt
+              and (l[i] <= zt or (zt_p is not None and c[i - 1] <= zt_p))
+              and (not p["retest_macd"] or macd > sig))
+        rs = (cs[i] < 0 and cs[i - 1] < 0 and c[i] < zb
+              and (h[i] >= zb or (zb_p is not None and c[i - 1] >= zb_p))
+              and (not p["retest_macd"] or sig > macd))
+        for side, hit in ((1, rl), (-1, rs)):
+            if hit and i - last_rt[side] > p["retest_cooldown"]:
+                retest[i] = side
+                last_rt[side] = i
+
+    return dict(trade=trade, flip=flip, retest=retest, adx_ok=adx_ok_s)
+
+
+def _last_event(series, i, lo):
+    """Индекс последнего ненулевого значения в series[lo..i] или None."""
+    for j in range(i, lo - 1, -1):
+        if series[j]:
+            return j
+    return None
+
+
+def signal_state(D, i, sig=None, fresh_bars=3, **params):
+    """Сигнальное состояние индикатора на закрытом баре i или None, если он не прогрелся.
+
+    sig — готовый результат signal_series(D, ...): при обходе многих баров не пересчитывать.
+    *_since — сколько баров назад случилось событие (0 — на баре i); None — в доступной
+    после прогрева истории события не было."""
+    if i < WARMUP or i >= D["n"]:
+        return None
+    sig = sig or signal_series(D, **params)
+    f = _last_event(sig["flip"], i, WARMUP)
+    r = _last_event(sig["retest"], i, WARMUP)
+    dip, dim, macd, sg = D["dip"][i], D["dim"][i], D["macd"][i], D["sig"][i]
+    return dict(
+        trade=sig["trade"][i],
+        trade_since=None if f is None else i - f,
+        trade_fresh=f is not None and i - f < fresh_bars,
+        retest_dir=0 if r is None else sig["retest"][r],
+        retest_since=None if r is None else i - r,
+        retest_fresh=r is not None and i - r < fresh_bars,
+        cs_dir=D["csDir"][i],
+        adx=D["adx"][i], adx_ok=sig["adx_ok"][i],
+        di_spread=None if dip is None or dim is None else dip - dim,
+        macd_up=None if macd is None or sg is None else macd > sg,
+    )

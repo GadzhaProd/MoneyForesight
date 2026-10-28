@@ -13,6 +13,11 @@ MoneyForesight — сканер пульта (этап 1): состояние Ra
   *     — цена пересекла линию в последние N свечей этого таймфрейма (FRESH_BARS)
   +     — цвет линии перешёл через 0.5 в последние N свечей
 
+Вторая таблица — сигналы самого индикатора (BUY/SELL по состоянию и ретест зоны-магнита):
+  LONG 12   — состояние BUY, возникло 12 свечей назад (… — давно, до окна истории)
+  SHORT 3!  — состояние SELL, ! — сигнал новый (в последние N свечей)
+  r↑ / r↓   — свежий ретест зоны-магнита вверх / вниз
+
 Запуск:
   python3 scan.py                          # монеты и таймфреймы из mf_config.py
   python3 scan.py BTCUSDT ETHUSDT          # свои монеты
@@ -28,10 +33,11 @@ import argparse, sys, time
 
 import backtest as bt
 import mf_config as cfg
-from mf_core import WARMUP, prepare, rainbow_state
+from mf_core import WARMUP, prepare, rainbow_state, signal_state
 
 BUCKET_EMOJI = {-2: "🟥🟥", -1: "🟧  ", 0: "🟨  ", 1: "🟩  ", 2: "🟩🟩"}   # ширина 4 колонки у всех
 ARROW = {1: "↑", -1: "↓", 0: "·"}
+SIGNAL_LABEL = {1: "LONG", -1: "SHORT", 0: "—"}
 EMOJI_W, TEXT_W = 4, 9
 CELL_W = EMOJI_W + 1 + TEXT_W
 
@@ -42,7 +48,11 @@ def scan_cell(symbol, tf, bars, fetch, fresh_bars, **fetch_kw):
     if len(kl) <= WARMUP:
         return None
     D = prepare(kl)
-    return rainbow_state(D, D["n"] - 1, fresh_bars=fresh_bars)
+    i = D["n"] - 1
+    state = rainbow_state(D, i, fresh_bars=fresh_bars)
+    if state is not None:
+        state["signal"] = signal_state(D, i, fresh_bars=fresh_bars)
+    return state
 
 
 def cell_text(state):
@@ -54,6 +64,23 @@ def cell_text(state):
     marks = ("*" if state["price_fresh"] else "") + ("+" if state["heat_fresh"] else "")
     text = f"{state['heat']:.2f}{ARROW[state['price_side']]}{marks}"
     return BUCKET_EMOJI[state["bucket"]] + " " + text.ljust(TEXT_W)
+
+
+def signal_cell_text(state):
+    """Ячейка второй таблицы: состояние BUY/SELL индикатора, давность, свежий сигнал и ретест."""
+    if isinstance(state, str):
+        return "ошибка".ljust(CELL_W)
+    sg = state.get("signal") if state else None
+    if sg is None:
+        return "н/д".ljust(CELL_W)
+    if sg["trade"] == 0:
+        text = SIGNAL_LABEL[0]
+    else:
+        since = "…" if sg["trade_since"] is None else str(sg["trade_since"])
+        text = f"{SIGNAL_LABEL[sg['trade']]} {since}" + ("!" if sg["trade_fresh"] else "")
+    if sg["retest_fresh"]:
+        text += f" r{ARROW[sg['retest_dir']]}"
+    return text.ljust(CELL_W)
 
 
 def _ago(bars):
@@ -71,15 +98,22 @@ def events(symbol, tf, state):
     if state["heat_fresh"]:
         way = "в зелёную половину" if state["heat_side"] > 0 else "в красно-оранжевую половину"
         out.append(f"{symbol} {tf}: цвет линии перешёл через 0.5 {way} ({_ago(state['heat_cross_bars'])})")
+    sg = state.get("signal")
+    if sg and sg["trade_fresh"]:
+        way = "BUY (лонг)" if sg["trade"] > 0 else "SELL (шорт)"
+        out.append(f"{symbol} {tf}: сигнал индикатора {way} ({_ago(sg['trade_since'])})")
+    if sg and sg["retest_fresh"]:
+        way = "вверх (лонг)" if sg["retest_dir"] > 0 else "вниз (шорт)"
+        out.append(f"{symbol} {tf}: ретест зоны-магнита {way} ({_ago(sg['retest_since'])})")
     return out
 
 
-def format_table(rows, symbols, tfs):
+def format_table(rows, symbols, tfs, cell=cell_text):
     head = "Монета".ljust(10) + "".join(tf.upper().ljust(CELL_W + 2) for tf in tfs)
     lines = [head, "-" * len(head)]
     for sym in symbols:
         lines.append(sym.replace("USDT", "").ljust(10)
-                     + "".join(cell_text(rows[sym][tf]).ljust(CELL_W) + "  " for tf in tfs))
+                     + "".join(cell(rows[sym][tf]).ljust(CELL_W) + "  " for tf in tfs))
     return "\n".join(lines)
 
 
@@ -132,9 +166,14 @@ def main(argv=None, fetch=None, out=print):
                 rows[sym][tf] = "ошибка"
                 errors.setdefault(f"{type(e).__name__}: {e}", []).append(f"{sym} {tf}")
 
+    out("Линия Rainbow")
     out(format_table(rows, symbols, tfs))
-    out("\n🟥🟥 сильное падение · 🟧 падение · 🟨 флэт · 🟩 рост · 🟩🟩 сильный рост   "
+    out("🟥🟥 сильное падение · 🟧 падение · 🟨 флэт · 🟩 рост · 🟩🟩 сильный рост   "
         "↑↓ цена выше/ниже линии   * пробила линию   + цвет перешёл через 0.5")
+    out("\nСигнал индикатора")
+    out(format_table(rows, symbols, tfs, cell=signal_cell_text))
+    out("LONG/SHORT N — состояние BUY/SELL и сколько свечей назад возникло   ! новый сигнал   "
+        "r↑ r↓ свежий ретест зоны")
 
     found = [e for sym in symbols for tf in tfs for e in events(sym, tf, rows[sym][tf])]
     if found:

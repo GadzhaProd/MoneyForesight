@@ -13,7 +13,8 @@ import scan
 
 
 def kline(i, c, step_ms=14_400_000):
-    return [i * step_ms, str(c), str(c * 1.002), str(c * 0.998), str(c), "100",
+    vol = "200" if i % 3 == 0 else "100"       # всплески объёма, иначе фильтр объёма глушит все сигналы
+    return [i * step_ms, str(c), str(c * 1.002), str(c * 0.998), str(c), vol,
             i * step_ms + step_ms - 1, "0", 0, "0", "0", "0"]
 
 
@@ -64,6 +65,16 @@ class TestRainbowCross(unittest.TestCase):
         self.assertEqual((s["price_side"], s["price_cross_bars"]), (1, 2))
         self.assertTrue(s["price_fresh"])
         self.assertFalse(core.rainbow_state(D, 210)["price_fresh"])
+
+    def test_freshness_boundary_is_exactly_fresh_bars(self):
+        D = self._price_case(201)
+        heat = [0.4 if j < 201 else 0.6 for j in range(self.N)]
+        D["heat"] = heat
+        inside = core.rainbow_state(D, 203, fresh_bars=3)          # 2 бара назад
+        edge = core.rainbow_state(D, 204, fresh_bars=3)            # ровно 3 бара назад — уже не свежее
+        self.assertEqual((inside["price_fresh"], inside["heat_fresh"]), (True, True))
+        self.assertEqual((edge["price_cross_bars"], edge["price_fresh"], edge["heat_fresh"]),
+                         (3, False, False))
 
     def test_cross_on_the_last_bar_is_zero_bars_ago(self):
         s = core.rainbow_state(self._price_case(203), 203)
@@ -193,6 +204,34 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(len(ev), 2)
         self.assertIn("вверх", ev[0])
         self.assertIn("зелёную", ev[1])
+
+    def test_signal_cell_and_events(self):
+        base = dict(trade=1, trade_since=2, trade_fresh=True, retest_dir=-1, retest_since=1,
+                    retest_fresh=True)
+        state = {"signal": base}
+        self.assertEqual(scan.signal_cell_text(state).rstrip(), "LONG 2! r↓")
+        quiet = {"signal": dict(base, trade=-1, trade_since=40, trade_fresh=False, retest_fresh=False)}
+        self.assertEqual(scan.signal_cell_text(quiet).rstrip(), "SHORT 40")
+        old = {"signal": dict(base, trade_since=None, trade_fresh=False, retest_fresh=False)}
+        self.assertEqual(scan.signal_cell_text(old).rstrip(), "LONG …")
+        none_yet = {"signal": dict(base, trade=0, trade_since=None, trade_fresh=False, retest_fresh=False)}
+        self.assertEqual(scan.signal_cell_text(none_yet).rstrip(), "—")
+        self.assertTrue(scan.signal_cell_text(None).startswith("н/д"))
+        self.assertTrue(scan.signal_cell_text("ошибка").startswith("ошибка"))
+
+        rb = dict(price_fresh=False, heat_fresh=False, signal=base)
+        ev = scan.events("ETHUSDT", "4h", rb)
+        self.assertEqual(len(ev), 2)
+        self.assertIn("BUY", ev[0])
+        self.assertIn("на последней" if base["trade_since"] == 0 else "2 св. назад", ev[0])
+        self.assertIn("ретест", ev[1])
+        self.assertIn("вниз", ev[1])
+
+    def test_main_prints_both_tables(self):
+        code, text = self.run_main("UPUSDT", "--tf", "1d")
+        self.assertEqual(code, 0)
+        self.assertIn("Линия Rainbow", text)
+        self.assertIn("Сигнал индикатора", text)
 
     def test_table_and_flat_summary(self):
         code, text = self.run_main("UPUSDT", "DOWNUSDT", "--tf", "1d", "--tf", "4h")
