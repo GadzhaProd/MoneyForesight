@@ -39,6 +39,9 @@
 | [`MoneyForesight_v3.pine`](MoneyForesight_v3.pine) | **Основной индикатор, v3.3.** Сигналы, зона-магнит, виртуальные сделки, S/R, статистика, алерты |
 | [`MoneyForesight_strategy.pine`](MoneyForesight_strategy.pine) | **Стратегия 1.3** для «Тестера стратегий»: та же логика входов и выходов, но с реальным учётом комиссии, проскальзывания и размера позиции |
 | [`backtest.py`](backtest.py) | Бэктест той же логики на Python по данным Binance: сетка параметров по 5 таймфреймам |
+| [`mf_core.py`](mf_core.py) | Ядро расчёта индикаторов на Python (общее для бэктеста и сканера): Chandelier, DMI/ADX, MACD, Rainbow |
+| [`scan.py`](scan.py) | Сканер пульта: состояние Rainbow по монетам и таймфреймам, свежие пробития. Настройки — в [`mf_config.py`](mf_config.py) |
+| [`docs/dashboard-plan.md`](docs/dashboard-plan.md) | План пульта управления: этапы, вероятность, источники данных |
 | [`tests/`](tests) | Юнит-тесты бэктестера и проверка, что фильтры Pine и Python совпадают |
 | [`MoneyForesight_diamonds.md`](MoneyForesight_diamonds.md) | Реестр лучших конфигураций по монетам |
 | [`docs/how-to-trade.md`](docs/how-to-trade.md) | **Руководство трейдера**: тренд, зона, входы, S/R, таблица статистики, чек-лист |
